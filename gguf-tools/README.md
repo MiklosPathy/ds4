@@ -231,7 +231,8 @@ their original FP8 values and scales, packed together at the end of the GGUF for
 disk lookups. Vision and DSpark are separate models and are not part of this
 text GGUF; `--dspark-out FILE` writes the checkpoint's DSpark stages to their own
 support GGUF for `--dspark --mtp-model`, and `--out` may be omitted to write only
-that file.
+that file; such a run opens only the shards that hold the `mtp.*` tensors (three
+of the 48 in the published index).
 
 The first conversion uses weight-energy importance for IQ2_XXS. After runtime
 calibration, add `--imatrix FILE` and choose a new output filename to regenerate
