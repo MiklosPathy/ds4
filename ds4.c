@@ -3091,6 +3091,8 @@ static ds4_dspark_summary model_dspark_summary(const ds4_model *m) {
         s.has_target_layers = true;
     }
 
+    (void)model_get_u32(m, "dspark.n_routed_experts", &s.n_expert);
+    (void)model_get_u32(m, "dspark.num_experts_per_tok", &s.n_expert_used);
     uint32_t max_stage = 0;
     bool have_stage = false;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
@@ -42877,6 +42879,7 @@ struct ds4_engine {
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
+    bool ds41_dspark;           /* V4.1 drafting from the DSpark support file */
 #ifndef DS4_NO_GPU
     ds4_glm53_vision_weights vision_weights;
     ds4_deepseek4_vision_weights deepseek4_vision_weights;
@@ -72066,6 +72069,24 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        /* The V4.1 engine drafts on its own: the V4 DSpark paths stay off. */
+        if (e->support_kind == DS4_SUPPORT_DSPARK) {
+            e->support_kind = DS4_SUPPORT_NONE;
+            e->ds41_dspark = e->dspark;
+        }
+        if (e->dspark && !e->ds41_dspark) {
+            fprintf(stderr, "ds4: --dspark needs the DSpark stages: pass --mtp-model FILE\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+    } else if (e->dspark && e->support_kind != DS4_SUPPORT_DSPARK) {
+        fprintf(stderr, "ds4: --dspark requires --mtp-model FILE\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
 
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CUDA) {
@@ -73865,6 +73886,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         s->ds41_graph_ready = true;
         s->ds41_graph.quality = e->quality;
+        if (e->ds41_dspark &&
+            !ds41_draft_init(&s->ds41_graph, &e->dspark_weights, &e->mtp_model))
+            fprintf(stderr, "ds4: DSpark drafting unavailable for this V4.1 session\n");
         if (e->tp.active) {
             s->ds41_graph.tp_world = 2;
             s->ds41_graph.tp_rank = (uint32_t)e->tp.rank;
