@@ -16,7 +16,7 @@ struct rocm_tp_job {
     void *in;
 };
 struct rocm_tp_state {
-    bool active = false, started = false;
+    bool active = false, started = false, spin_scalar = false;
     uint64_t seq = 0, posted = 0, pending = 0, timeout_ticks = 0;
     uint32_t pending_count = 0;
     bool pending_deferred = false;
@@ -109,7 +109,22 @@ static __global__ void rocm_tp_wait_add_release(rocm_tp_shared *s, unsigned slot
         __hip_atomic_store(&s->slots[slot].consumed, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-static void rocm_tp_pause(unsigned *spins) {
+static void rocm_tp_pause(unsigned *spins, bool spin_scalar = false) {
+    /* Scalar gates benefit from avoiding scheduler wakeup latency. Yield
+     * periodically; bulk prefill and queue backpressure keep the sleep policy. */
+    if (spin_scalar) {
+        if (++*spins < 10000u) {
+#if defined(__x86_64__)
+            __builtin_ia32_pause();
+#else
+            __asm__ volatile("" ::: "memory");
+#endif
+            return;
+        }
+        *spins = 0;
+        sched_yield();
+        return;
+    }
     if (++*spins < 100) { sched_yield(); return; }
     const struct timespec delay = {0, 10000};
     nanosleep(&delay, nullptr);
@@ -122,13 +137,14 @@ static void *rocm_tp_service(void *) {
         pthread_mutex_unlock(&g_rocm_tp_mutex);
         if (ds4_gpu_tp_failed()) return nullptr;
         const unsigned slot = (unsigned)((seq - 1) % ROCM_TP_QUEUE);
+        const bool spin_scalar = g_rocm_tp.spin_scalar && g_rocm_tp.jobs[slot].kind == 0;
         unsigned spins = 0;
         for (;;) {
             if (ds4_gpu_tp_failed()) return nullptr;
             uint64_t ready = __atomic_load_n(&g_rocm_tp.host->slots[slot].ready, __ATOMIC_ACQUIRE);
             if (ready == seq) break;
             if (ready > seq) { rocm_tp_fail(); return nullptr; }
-            rocm_tp_pause(&spins);
+            rocm_tp_pause(&spins, spin_scalar);
         }
         const rocm_tp_job job = g_rocm_tp.jobs[slot];
         int ok = job.seq == seq;
@@ -170,6 +186,7 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
     g_rocm_tp.device = (rocm_tp_shared *)g_rocm_tp.flags->ptr;
     memset(g_rocm_tp.host, 0, sizeof(rocm_tp_shared));
     g_rocm_tp.timeout_ticks = (uint64_t)khz * 1000u * 5u;
+    g_rocm_tp.spin_scalar = ds4_rocm_is_gfx1151();
     g_rocm_tp.active = true;
     g_rocm_tp.slab = slab;
     g_rocm_tp.exchange = fn;
