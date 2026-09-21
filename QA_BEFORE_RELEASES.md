@@ -1112,6 +1112,8 @@ clients.
   and streaming decode. Repeat across OpenAI chat, Responses, Anthropic, and
   completions. Abandoned work must stop at the next backend-safe boundary, and
   a valid request after each cancellation must complete normally.
+- For V4.1 concurrent serving, run `tests/test_server_batching.py --pairs 8 --workers 4 --output batching.json` with the server defaults, then repeat with `--stream --cancel-first 4` and `--same-prompt --case long-greedy`. Cover resident and SSD experts, cold and restored disk checkpoints, and a separately recorded `--mixed-prefill-quantum 2048` control. Preserve full responses and inspect actual slot overlap and chunk boundaries. Fixed-size diagnostic controls do not substitute for testing the defaults. Fixture groups named "batch" in official scoring do not test concurrent requests.
+- Set time limits from observed model loading, prefill, generation and queue duration. If a test is still progressing when its limit expires, preserve the attempt, increase or remove the inadequate limit and complete it; investigate a stalled test. Do not count partial assertions as a completed suite. For the vision-cache test, use `--timeout` and `--thinking-tokens` when the model needs more time or reasoning tokens, recording the settings and checking that answers finish normally.
 - For the repeatable chat-completions cancellation and slot-reuse gate, run
   `python3 tests/test_server_batching.py --url http://127.0.0.1:8000 --pairs 2
   --workers 4 --case short-sampled --max-tokens 12 --cancel-first 4`. Then run
@@ -1677,6 +1679,39 @@ Exclude loading. Only the first row is initial prefill; later rows are appends.
   --prompt-file speed-bench/promessi_sposi.txt --ctx-start 4096 --ctx-max 32768 \
   --step-mul 2 --ctx-alloc 36864 --gen-tokens 128 --show-output --csv RESULT.csv
 ```
+
+## DeepSeek V4.1 Flash (ROCm/gfx1151)
+
+- ROCm 10.0, Strix Halo `gfx1151`, calibrated `DeepSeek-V4.1-Flash-Q2.gguf` (365,713,686,528 bytes; saved SHA-256 `1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42`). Text/vision, resident experts, SSD streaming and two-machine inference; Engram stays disk-backed.
+- Official scoring: 115 cases / 3,954 teacher-forced targets per ROCm resident and two-machine panel, default arithmetic, no DSpark or `--quality`. CUDA is the recorded `a04f46f` GB10 reference with a 76 GiB SSD cache; it predates later CUDA SSD prefill changes. Metal values are published same-Q2 aggregates. CUDA and Metal figures are recorded references; this ROCm panel did not rerun them.
+
+| Official panel | Targets | ROCm resident NLL | ROCm two-rank NLL | CUDA reference NLL |
+|---|---:|---:|---:|---:|
+| General 100 | 2,994 | 0.368267385 | 0.362317121 | 0.363135483 |
+| Batched 12 | 768 | 0.521719404 | 0.525356473 | 0.521390812 |
+| Selected 8K; 8,197 prompt tokens | 64 | 0.133878180 | 0.138695106 | 0.116477286 |
+| Selected 16K; 16,389 prompt tokens | 64 | 0.488504024 | 0.497056311 | 0.478793408 |
+| Selected 64K; 65,541 prompt tokens | 64 | 0.439256315 | 0.448364408 | 0.437359191 |
+
+| General 100 backend/mode | NLL | Target-logprob MAE | Recorded API top1 agreement |
+|---|---:|---:|---:|
+| ROCm resident | 0.368267385 | 0.230736441 | 2705/2994 |
+| ROCm two-rank | 0.362317121 | 0.223234795 | 2704/2994 |
+| CUDA SSD | 0.363135483 | 0.223383502 | 2696/2994 |
+| Published Metal resident batching | 0.365680596 | — | 2705/2994 |
+| Published Metal scalar/SSD | 0.364576009 | 0.227531809 | 2697/2994 |
+
+- Probability results are mixed. Resident general NLL is 0.71% above published Metal resident and 1.41% above CUDA. The selected long cases each contain only 64 targets; neither these scores nor passing practical checks establish universal generation or distribution equivalence.
+- Fixed-length greedy literary continuations can become repetitive; the native benchmark checks timing and completion, not prose quality. Coding, tool-use and image checks use their own prompts and validators.
+- Practical checks pass in resident and two-machine modes: nine executable coding checks with a 36,992-token prompt, seven real tool-use checks after a 9,509-token prompt and a 24-token cached append, plus 28 sampled checks. Sampled settings: temperature 0.6, top-p 0.95, seed 1729, min-p/top-k 0; thinking and DSpark off.
+- State: 69 exact comparisons and 138 full logit vectors per resident/two-machine panel. Covers interleaved sessions, snapshot restore, rewind, corrupt snapshot rejection and three cancellation/recovery modes, at lengths from 31 through 16,383 tokens. Current transport measurements and complete-output checks are listed in [CLUSTERING_ROCM.md](docs/CLUSTERING_ROCM.md#measured-performance).
+- Vision: six resident and six RoCE image cases pass, plus focused SSD photo/screenshot checks; 168 full vectors and 112 complete states in total. Image facts, image changes and exact replay are checked. Restoring an image snapshot into a new session and every image over every transport were not tested. Image inputs are correctness checks, not timing inputs.
+- SSD: 92 GiB cache, fresh 16K/64K with 69,632 allocated context and 512/128 outputs; complete frontiers and printed continuations match resident execution. Memory/swap results and exact commands are in [STRIX_HALO.md](docs/STRIX_HALO.md#ssd-performance).
+- Kernel checks cover production layouts, full outputs, independent FP64 references, tail rows, canaries, selection ties and nonfinite inputs. The V4.1 split-key decode attention path uses FP32 throughout; matrix instructions remain in the prefill paths. FP16 matrix paths accumulate in FP32; Engram packing checks representability and retains the FP32 fallback. Numerical differences are assessed with the official and practical results above.
+- ROCm/gfx1151/V4.1 guards preserve other model/backend paths. Shared CPU/CUDA/Metal code was checked with preprocessing comparisons; five frontends build/link/help checks and relevant memory/cache/Engram units pass. No fresh physical GLM, CUDA or Metal regression run is claimed.
+- Exactly two machines, each with its assigned experts in RAM; no cluster SSD streaming or DSpark. RoCE uses system-RAM staging. Plain TCP over USB4 Ethernet also works. Long-running production endurance was not tested.
+- Performance, hardware/SSD/profile details and commands: [single-node SSD](docs/STRIX_HALO.md#deepseek-v41-flash), [TCP/RoCE](docs/CLUSTERING_ROCM.md#measured-performance).
+
 
 ### CUDA SSD Streaming
 
