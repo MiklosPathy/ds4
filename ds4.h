@@ -455,6 +455,13 @@ bool ds4_session_vision_prefix_matches(const ds4_session *s,
 bool ds4_session_vision_state_matches(const ds4_session *s,
                                       const ds4_vision_span *images,
                                       size_t image_count);
+/* Fingerprint-only image prefix: every historical image matches by row count
+ * and fingerprint, ignoring token positions (which rebase repairs) and
+ * allowing appended request images.  Lets the server routing probe admit
+ * image-append continuations while still rejecting pixel mismatches. */
+bool ds4_session_vision_fingerprint_prefix_matches(const ds4_session *s,
+                                                   const ds4_vision_span *images,
+                                                   size_t image_count);
 /* Restore image positions from an independently authenticated live continuation
  * (for example, matching tool-call IDs). Checks every fingerprint and row count;
  * on failure, leaves spans unchanged. This does not verify the text history. */
@@ -468,6 +475,16 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
+bool ds4_session_checkpoint_valid(const ds4_session *s);
+/* Test helpers (ds4-test): allocate a session shell holding only the given
+ * checkpoint tokens, for server-side routing/probe unit tests.  Not usable
+ * for inference; free with ds4_session_free_test_checkpoint(). */
+ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n);
+void ds4_session_free_test_checkpoint(ds4_session *s);
+/* Attach synthetic image identities to a test checkpoint (copies
+ * token_start/row-count/fingerprint per span).  Not usable for inference. */
+void ds4_session_set_test_images(ds4_session *s,
+                                 const ds4_vision_span *images, size_t n);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
@@ -526,6 +543,16 @@ typedef struct {
  * sequential fallback. */
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen);
+/* One speculative cycle for a batch of sessions (greedy acceptance, Qwen3.8
+ * with --mtp): each item feeds its token; a pending draft rides along as a
+ * second row and is committed when it is the target's argmax.  accepted[i]
+ * lists the tokens committed for item i (the fed token, then the draft) and
+ * n_accepted[i] how many; the session's logits then follow its last
+ * committed token.  Engines without native batching run one cycle per
+ * session in turn. */
+int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
+                                               int (*accepted)[2], int *n_accepted,
+                                               char *err, size_t errlen);
 /* Advance one resumed prefill suffix and an independent decode batch as one
  * scheduling step. Unsupported combinations use the ordinary serialized
  * session operations. */
