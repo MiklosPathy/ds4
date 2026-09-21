@@ -97,51 +97,26 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ## Measured performance
 
 - Two Framework Desktop systems, 128 GB each, 16-core Strix Halo / `gfx1151`; coordinator Ryzen AI Max+ 395, worker engineering sample `100-000001243-50_Y`.
-- Model drives: coordinator SK hynix PC711 1 TB (PCIe 3.0 ×4, ext4); worker Kingston FURY Renegade 2 TB (`SFYRD2000G`, PCIe 4.0 ×4, btrfs). Engram remains disk-backed.
-- TCP/RoCE: Intel E810-C QSFP NICs, 100 Gb/s link, MTU 9000. Coordinator NIC negotiated PCIe 3.0 ×4; worker PCIe 4.0 ×4.
-- Existing boot settings include `pci=realloc pcie_aspm=off`, in addition to the [GPU-visible memory settings](STRIX_HALO.md#gpu-visible-memory). Their individual performance effect was not isolated.
-- Linux `7.2.5-100.fc43.x86_64`, ROCm 10.0 SDK (`10.0.0-4`, HIP `7.15.26333`). TuneD `accelerator-performance`, fans at maximum speed on both machines.
-- Same Q2 file, 69,632 allocated context, fresh full prefix, fixed greedy outputs, no DSpark or images. Native `ds4-bench`; startup and a 256-token/128-output warmup excluded. One run per cell; values are **prefill / decode tokens/s**.
+- Model drives: coordinator SK hynix PC711 1 TB (PCIe 3.0 ×4, ext4); worker Kingston FURY Renegade 2 TB (`SFYRD2000G`, PCIe 4.0 ×4, btrfs). Engram stays disk-backed.
+- Intel E810-C QSFP NICs, 100 Gb/s, MTU 9000; coordinator NIC at PCIe 3.0 ×4, worker at PCIe 4.0 ×4. Device logs and hardware send counters confirm RDMA payloads; TCP also carries RoCE connection setup.
+- Linux `7.2.5-100.fc43.x86_64`, ROCm SDK `10.0.0-4` / HIP `7.15.26333`, TuneD `accelerator-performance`. Existing boot settings include `pci=realloc pcie_aspm=off` and the [GPU-visible memory settings](STRIX_HALO.md#gpu-visible-memory); their individual effects were not isolated.
+- Native `ds4-bench`, Q2, 34,816 allocated context, 128 greedy output tokens per frontier, no DSpark or images. First row is a fresh prefix; second appends 8,192 tokens to the restored prefix. Startup excluded; one final run per cell, not a cold-cache measurement. Values are **prefill / decode tokens/s**.
 
-| Prompt tokens | Generated tokens | TCP, 100 GbE | RoCE RC, 100 GbE |
+| Context tokens | Appended tokens | TCP, 100 GbE | RoCE, 100 GbE |
 |---:|---:|---:|---:|
-| 1,024 | 128 | 123.54 / 15.42 | 123.80 / 15.94 |
-| 16,384 | 512 | 412.94 / 15.59 | 410.54 / 15.94 |
-| 65,536 | 128 | 432.83 / 14.96 | 431.85 / 15.33 |
+| 8,192 | 8,192 | 395.61 / 16.59 | 391.56 / 17.33 |
+| 16,384 | 8,192 | 382.74 / 16.32 | 380.32 / 17.13 |
 
-- A second RoCE 16K/512 run measured **408.25 / 15.92** prefill/decode tokens/s.
-- All 129,280 frontier logits and complete printed continuations match across transports at each depth. No OOM; minimum usable RAM in the qualification panel: at least 32.9 GiB. Host zram swap-out was nonzero; these are not zero-swap or cold-cache measurements.
-- RoCE device logs and hardware send counters confirm RDMA payloads on both peers. Its TCP control connection is intentional; similar decode rates do not indicate TCP fallback.
-- V4.1 CED uses about 8B active parameters/token in prefill and 16B in decode. Full prefixes exercise the decoder-suffix optimization; short appends can follow a different schedule. [Architecture](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/df42c109f1defefcbfcedbe7d905718a12266e40/README.md?code=true).
-- Results apply to these drives, NIC attachment, profile. Other network adapters have not been tested. Long-running production use has not been tested.
-
-### Appending to an existing prompt
-
-Separately recorded measurements of the unchanged prefill path: same hardware, allocation and warmup; one live session, no generation between frontiers. Values time only the newly appended tokens, in tokens/s.
-
-| Existing → final tokens | Added tokens | TCP, 100 GbE | RoCE |
-|---:|---:|---:|---:|
-| 4,096 → 8,192 | 4,096 | 219.61 | 218.78 |
-| 8,192 → 16,384 | 8,192 | 359.70 | 355.86 |
-| 57,344 → 65,536 | 8,192 | 314.92 | 313.65 |
+- Full 129,280-logit vectors and 128-token continuations match controls and each other. No OOM. Scalar transport waiting uses active CPU polling; measured CPU cost is about half a core per host during decode.
+- V4.1 CED uses about 8B active parameters/token in prefill and 16B in decode. Short appends can follow a different schedule. [Architecture](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/df42c109f1defefcbfcedbe7d905718a12266e40/README.md?code=true).
 
 ### Reproduce the table
 
-Build the engine on both machines. On the coordinator, build the included TP-only warmup adapter; it links the existing engine objects and leaves `ds4-bench` untouched:
-
-```bash
-make strix-halo ROCM_ARCH=gfx1151
-bash speed-bench/build-rocm-v41-warmup.sh  # Coordinator only
-
-tuned-adm active                        # Expect accelerator-performance during the workload
-tuned-adm verify                        # Verify the applied profile
-```
-
-Set this in both terminals after the relevant device setup above:
+Use the transport/device setup above on both machines, then set:
 
 ```bash
 MODEL=/absolute/path/DeepSeek-V4.1-Flash-Q2.gguf
-COORD=10.99.0.1                         # Coordinator address on the selected link
+COORD=10.99.0.1
 TRANSPORT=rdma                         # tcp or rdma
 DEV=rocep194s0                          # This host's active verbs device
 GID=1                                  # This host's matching RoCE v2 GID
@@ -152,33 +127,24 @@ esac
 ```
 
 ```bash
-# Coordinator: 16K/512; use DEPTH=1024 or 65536 with GEN=128 for the other rows.
-DEPTH=16384
-GEN=512
-./ds4-bench-warm --backend rocm -m "$MODEL" \
-  --prompt-file speed-bench/promessi_sposi.txt \
-  --ctx-start "$DEPTH" --ctx-max "$DEPTH" --ctx-alloc 69632 \
-  --gen-tokens "$GEN" --show-output --csv "tp-$TRANSPORT-$DEPTH.csv" \
-  --dump-frontier-logits-dir "frontiers-$TRANSPORT-$DEPTH" \
-  --role coordinator --listen "$COORD" 19475 "${LINK[@]}"
+# Coordinator, from the engine source directory: prepare the measured text.
+python3 - <<'PYTHON'
+from pathlib import Path
+text = Path('tests/test-vectors/flash-vision-exp/prompts/long_memory_archive.txt').read_text()
+Path('bench-prompt.txt').write_text((text + '\n') * 16)
+PYTHON
 
-# Worker: start for each coordinator run.
-./ds4 --rocm -m "$MODEL" --ctx 69632 \
-  --role worker --coordinator "$COORD" 19475 "${LINK[@]}"
+tuned-adm active                        # Verify accelerator-performance during the workload
+DS4_BENCH_SNAPSHOT_MAX_BYTES=2147483648 ./ds4-bench --rocm -m "$MODEL" \
+  --prompt-file bench-prompt.txt \
+  --ctx-start 8192 --ctx-max 16384 --step-mul 1 --step-incr 8192 --ctx-alloc 34816 \
+  --gen-tokens 128 --show-output --csv "tp-$TRANSPORT.csv" \
+  --dump-frontier-logits-dir "frontiers-$TRANSPORT" \
+  --role coordinator --listen "$COORD" 9911 "${LINK[@]}"
+
+# Worker, start for each coordinator run.
+./ds4 --rocm -m "$MODEL" --ctx 34816 \
+  --role worker --coordinator "$COORD" 9911 "${LINK[@]}"
 ```
 
-- The adapter warms 256 prefix tokens and 128 decode steps, then creates a fresh session before the unchanged native measured loop. A separate short process is not the same warmup procedure.
-- Preserve the CSV, full frontier files, printed continuation, revision/build flags, model identity, active power profile and swap/OOM counters. Verify the active power profile before comparing timings; no image-conditioned prefill timings.
-
-For the append table, keep the worker command and replace the coordinator command with:
-
-```bash
-# 4K → 8K → 16K, no generated tokens between appends
-./ds4-bench-warm --backend rocm -m "$MODEL" \
-  --prompt-file speed-bench/promessi_sposi.txt \
-  --ctx-start 4096 --ctx-max 16384 --step-mul 2 --ctx-alloc 69632 \
-  --gen-tokens 0 --csv "append-$TRANSPORT.csv" \
-  --dump-frontier-logits-dir "append-frontiers-$TRANSPORT" \
-  --role coordinator --listen "$COORD" 19475 "${LINK[@]}"
-# For 56K → 64K: --ctx-start 57344 --ctx-max 65536 --step-mul 1 --step-incr 8192
-```
+- The 2 GiB snapshot cap avoids replaying a prefix when restoring benchmark state; leave sufficient free RAM. Save CSV, frontier files, output, revision/build flags, model filename/size, profile and memory/swap counters.

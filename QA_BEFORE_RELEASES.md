@@ -1682,36 +1682,24 @@ Exclude loading. Only the first row is initial prefill; later rows are appends.
 
 ## DeepSeek V4.1 Flash (ROCm/gfx1151)
 
-- ROCm 10.0, Strix Halo `gfx1151`, calibrated `DeepSeek-V4.1-Flash-Q2.gguf` (365,713,686,528 bytes; saved SHA-256 `1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42`). Text/vision, resident experts, SSD streaming and two-machine inference; Engram stays disk-backed.
-- Official scoring: 115 cases / 3,954 teacher-forced targets per ROCm resident and two-machine panel, default arithmetic, no DSpark or `--quality`. CUDA is the recorded `a04f46f` GB10 reference with a 76 GiB SSD cache; it predates later CUDA SSD prefill changes. Metal values are published same-Q2 aggregates. CUDA and Metal figures are recorded references; this ROCm panel did not rerun them.
+- ROCm 10.0, Strix Halo `gfx1151`, published `DeepSeek-V4.1-Flash-Q2.gguf`. Text/vision, resident experts, SSD streaming and two-machine TCP/RoCE; Engram stays disk-backed.
+- Official scoring: 227 cases per mode, comprising the new 112-case continuation suite and previous 115-case suite. New suite: 6,923 teacher-forced targets; API probability comparisons use 6,858 aligned positions, excluding case 047's reference alignment mismatch. Lower NLL/MAE is better.
 
-| Official panel | Targets | ROCm resident NLL | ROCm two-rank NLL | CUDA reference NLL |
-|---|---:|---:|---:|---:|
-| General 100 | 2,994 | 0.368267385 | 0.362317121 | 0.363135483 |
-| Batched 12 | 768 | 0.521719404 | 0.525356473 | 0.521390812 |
-| Selected 8K; 8,197 prompt tokens | 64 | 0.133878180 | 0.138695106 | 0.116477286 |
-| Selected 16K; 16,389 prompt tokens | 64 | 0.488504024 | 0.497056311 | 0.478793408 |
-| Selected 64K; 65,541 prompt tokens | 64 | 0.439256315 | 0.448364408 | 0.437359191 |
+| Mode | New 112 NLL | Long 12 NLL | API target-logprob MAE | API top1 agreement | Previous 115 NLL |
+|---|---:|---:|---:|---:|---:|
+| ROCm resident | 0.39578030 | 0.19736021 | 0.21899533 | 90.449% | 0.39737428 |
+| ROCm SSD | 0.39618195 | 0.19406948 | 0.21957840 | 90.478% | 0.39357626 |
+| ROCm RoCE | 0.39619718 | 0.20031244 | 0.21992302 | 90.522% | 0.39393896 |
+| CUDA SSD | 0.39251799 | 0.20265270 | 0.21669296 | 90.580% | 0.39295501 |
 
-| General 100 backend/mode | NLL | Target-logprob MAE | Recorded API top1 agreement |
-|---|---:|---:|---:|
-| ROCm resident | 0.368267385 | 0.230736441 | 2705/2994 |
-| ROCm two-rank | 0.362317121 | 0.223234795 | 2704/2994 |
-| CUDA SSD | 0.363135483 | 0.223383502 | 2696/2994 |
-| Published Metal resident batching | 0.365680596 | — | 2705/2994 |
-| Published Metal scalar/SSD | 0.364576009 | 0.227531809 | 2697/2994 |
-
-- Probability results are mixed. Resident general NLL is 0.71% above published Metal resident and 1.41% above CUDA. The selected long cases each contain only 64 targets; neither these scores nor passing practical checks establish universal generation or distribution equivalence.
-- Fixed-length greedy literary continuations can become repetitive; the native benchmark checks timing and completion, not prose quality. Coding, tool-use and image checks use their own prompts and validators.
-- Practical checks pass in resident and two-machine modes: nine executable coding checks with a 36,992-token prompt, seven real tool-use checks after a 9,509-token prompt and a 24-token cached append, plus 28 sampled checks. Sampled settings: temperature 0.6, top-p 0.95, seed 1729, min-p/top-k 0; thinking and DSpark off.
-- State: 69 exact comparisons and 138 full logit vectors per resident/two-machine panel. Covers interleaved sessions, snapshot restore, rewind, corrupt snapshot rejection and three cancellation/recovery modes, at lengths from 31 through 16,383 tokens. Current transport measurements and complete-output checks are listed in [CLUSTERING_ROCM.md](docs/CLUSTERING_ROCM.md#measured-performance).
-- Vision: six resident and six RoCE image cases pass, plus focused SSD photo/screenshot checks; 168 full vectors and 112 complete states in total. Image facts, image changes and exact replay are checked. Restoring an image snapshot into a new session and every image over every transport were not tested. Image inputs are correctness checks, not timing inputs.
-- SSD: 92 GiB cache, fresh 16K/64K with 69,632 allocated context and 512/128 outputs; complete frontiers and printed continuations match resident execution. Memory/swap results and exact commands are in [STRIX_HALO.md](docs/STRIX_HALO.md#ssd-performance).
-- Kernel checks cover production layouts, full outputs, independent FP64 references, tail rows, canaries, selection ties and nonfinite inputs. The V4.1 split-key decode attention path uses FP32 throughout; matrix instructions remain in the prefill paths. FP16 matrix paths accumulate in FP32; Engram packing checks representability and retains the FP32 fallback. Numerical differences are assessed with the official and practical results above.
-- ROCm/gfx1151/V4.1 guards preserve other model/backend paths. Shared CPU/CUDA/Metal code was checked with preprocessing comparisons; five frontends build/link/help checks and relevant memory/cache/Engram units pass. No fresh physical GLM, CUDA or Metal regression run is claimed.
-- Exactly two machines, each with its assigned experts in RAM; no cluster SSD streaming or DSpark. RoCE uses system-RAM staging. Plain TCP over USB4 Ethernet also works. Long-running production endurance was not tested.
-- Performance, hardware/SSD/profile details and commands: [single-node SSD](docs/STRIX_HALO.md#deepseek-v41-flash), [TCP/RoCE](docs/CLUSTERING_ROCM.md#measured-performance).
-
+- CUDA SSD was rerun on NVIDIA GB10 with the same published Q2. CUDA has lower aggregate NLL; ROCm has lower NLL on the 12 long cases, which cover three task families. These results do not establish a universal backend ranking.
+- Full panels precede the final vision/query-layout/TP-wait optimizations. Follow-up scoring preserves the scores exactly: all 112 resident cases for query layout, focused SSD/TCP/RoCE cases, and final combined resident/TCP/RoCE cases including a 23K prompt.
+- The official scorer uses FP32 for the query projection. Its matrix-instruction path is checked separately with full kernel outputs and native 129,280-logit vectors and 128-token continuations; all match the corresponding controls exactly.
+- Resident, SSD, TCP and RoCE serving checks cover coding/tool use, state restore/rewind, cancellation, session reuse and all 23 vision/cache cases. Final TCP/RoCE checks each complete 16 JSON replies, 16 SSE replies and four cancellations. Cross-schedule reply equality is not a promised contract; protocol/state checks pass.
+- Vision attention: 390 independent kernel checks and 63 full encoder captures across seven images preserve outputs bitwise, including boundary-size tests and the small-image fallback.
+- Shared units, Linux TCP stress tests, ROCm transport/gate reuse and injected-failure checks, and five frontend build/link/help checks pass. No fresh physical Metal or GLM regression run is claimed.
+- Exactly two machines, each fitting its assigned experts in RAM; no cluster SSD streaming or DSpark. RoCE uses system-RAM staging. Populated 256K and long-running production endurance are unqualified.
+- Hardware, native performance and commands: [single-node SSD](docs/STRIX_HALO.md#deepseek-v41-flash), [TCP/RoCE](docs/CLUSTERING_ROCM.md#measured-performance).
 
 ### CUDA SSD Streaming
 

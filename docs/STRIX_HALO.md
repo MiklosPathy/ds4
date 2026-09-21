@@ -56,23 +56,25 @@ SSD-streaming path.
 
 ## DeepSeek V4.1 Flash
 
-- ROCm 10.0 supports calibrated V4.1 Flash Q2 text/vision, resident experts, SSD streaming and [two-machine TCP/RoCE](CLUSTERING_ROCM.md). Engram remains disk-backed in every mode.
-- Tested SSD configuration: 128 GB Framework Desktop, 16-core Strix Halo engineering sample `100-000001243-50_Y`, Radeon `gfx1151`; Kingston FURY Renegade 2 TB (`SFYRD2000G`, PCIe 4.0 ×4, btrfs) holds the model.
-- Linux `7.2.5-100.fc43.x86_64`, ROCm SDK `10.0.0-4` / HIP `7.15.26333`; TuneD **`accelerator-performance`**, fans at maximum speed. Existing boot flags: the [GTT/TTM settings above](#gpu-visible-memory), plus `pci=realloc pcie_aspm=off`; their individual effects were not isolated.
+- ROCm 10.0 supports published V4.1 Flash Q2 text/vision, resident experts, SSD streaming and [two-machine TCP/RoCE](CLUSTERING_ROCM.md). Engram remains disk-backed.
+- SSD measurements: 128 GB Framework Desktop, Ryzen AI Max+ 395, Radeon `gfx1151`; SK hynix PC711 1 TB (PCIe 3.0 ×4, ext4) holds the model. Linux `7.2.5-100.fc43.x86_64`, ROCm SDK `10.0.0-4` / HIP `7.15.26333`, TuneD **`accelerator-performance`**.
 
 ### SSD performance
 
-Native `ds4-bench`, full fresh text prefix, greedy decoding, no DSpark or images; 92 GiB expert/staging cache. One run per row, startup and a separate GPU readiness warmup excluded; **tokens/s**:
+Native `ds4-bench`, 76 GiB expert-cache request, 34,816 allocated context, 128 greedy output tokens per frontier, no DSpark or images. First row is fresh prefill; subsequent rows append to restored prefixes. One run per row, startup excluded; no cold-cache claim. **Tokens/s**:
 
-| Prompt tokens | Allocated context | Generated tokens | Prefill | Decode |
-|---:|---:|---:|---:|---:|
-| 16,384 | 69,632 | 512 | 301.23 | 9.73 |
-| 65,536 | 69,632 | 128 | 350.03 | 9.08 |
+| Context tokens | Appended tokens | Prefill | Decode |
+|---:|---:|---:|---:|
+| 2,048 | 2,048 | 47.32 | 10.18 |
+| 4,096 | 2,048 | 86.48 | 10.27 |
+| 8,192 | 4,096 | 154.58 | 10.46 |
+| 16,384 | 8,192 | 271.06 | 10.34 |
+| 32,768 | 16,384 | 333.84 | 10.34 |
 
-- All 129,280 frontier logits and complete printed continuations match the corresponding resident runs. Minimum usable RAM: 12.25 GiB; no OOM. Host zram swap-out pages in table order: 0, 0. No cold-cache claim; other qualification runs recorded nonzero host swap.
-- The tuned Engram matrix path requires hipBLASLt 100401, revision `8d1ae90e`; other library versions retain the existing fallback and may have different prefill performance.
-- Actual prompts reach 65,536 tokens; populated 256K was not tested. Cache admission depends on available RAM, context and sessions; images may need a smaller cache. The GPU-visible limit shares system RAM and is not a cache budget.
-- Six resident image/state cases and two focused SSD cases (photo and screenshot) pass on this source. Official probability results are mixed; see [quality and limitations](../QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151). No image-conditioned prefill timing is included.
+- Full frontier logits and continuations match the corresponding controls.
+- The tuned Engram matrix path requires hipBLASLt 100401, revision `8d1ae90e`; other library versions retain the fallback and may have different prefill performance.
+- Cache admission depends on available RAM, context and sessions; images may need a smaller cache. The GPU-visible limit shares system RAM and is not a cache budget. Populated 256K is unqualified.
+- Resident/SSD image and cache checks pass; see [quality results](../QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151). Image inputs are excluded from text timing.
 
 ### Run text or vision
 
@@ -85,39 +87,31 @@ VISION=gguf/DeepSeek-V4.1-Flash-Vision.gguf
 
 # CLI, text
 ./ds4 --rocm -m "$MODEL" --ssd-streaming \
-  --ssd-streaming-cache-experts 92GB --ctx 69632
+  --ssd-streaming-cache-experts 76GB --ctx 34816
 
-# HTTP server, text and images; --vision takes the matching sidecar.
+# HTTP server, text and images
 ./ds4-server --rocm -m "$MODEL" --vision "$VISION" \
-  --ssd-streaming --ssd-streaming-cache-experts 92GB --ctx 69632 \
+  --ssd-streaming --ssd-streaming-cache-experts 76GB --ctx 34816 \
   --batched-session 1 --host 127.0.0.1 --port 8080
 ```
 
-For a machine with sufficient RAM for resident experts, omit both SSD options. Keep `--vision` for image requests and set `--ctx` to the required allocation. See [image request examples](MODELS.md#vision).
+For sufficient RAM to keep experts resident, omit both SSD options. Keep `--vision` for images and set `--ctx` to the required allocation. See [image requests](MODELS.md#vision).
 
 ### Reproduce SSD measurements
 
-Run one configuration per process; preserve the CSV, full frontier files and printed output. The timing input is the repository's `speed-bench/promessi_sposi.txt`.
+Prepare `bench-prompt.txt` as in the [cluster benchmark](CLUSTERING_ROCM.md#reproduce-the-table), then run from the engine build directory:
 
 ```bash
-tuned-adm active    # Expect accelerator-performance during the workload
-tuned-adm verify
-MODEL=/absolute/path/DeepSeek-V4.1-Flash-Q2.gguf
-DEPTH=16384
-ALLOC=69632
-GEN=512
-# Other row: DEPTH=65536 ALLOC=69632 GEN=128
-
-DS4_METAL_CB_TIMES=1 ./ds4-bench --backend rocm -m "$MODEL" \
-  --ssd-streaming --ssd-streaming-cache-experts 92GB \
-  --prompt-file speed-bench/promessi_sposi.txt \
-  --ctx-start "$DEPTH" --ctx-max "$DEPTH" --ctx-alloc "$ALLOC" \
-  --gen-tokens "$GEN" --show-output --csv "ssd-$DEPTH-$GEN.csv" \
-  --dump-frontier-logits-dir "ssd-frontiers-$DEPTH-$GEN"
+tuned-adm active    # Verify accelerator-performance during the workload
+DS4_BENCH_SNAPSHOT_MAX_BYTES=2147483648 ./ds4-bench --rocm -m "$MODEL" \
+  --ssd-streaming --ssd-streaming-cache-experts 76GB \
+  --prompt-file bench-prompt.txt \
+  --ctx-start 2048 --ctx-max 32768 --step-mul 2 --ctx-alloc 34816 \
+  --gen-tokens 128 --show-output --csv ssd.csv \
+  --dump-frontier-logits-dir ssd-frontiers
 ```
 
-- `DS4_METAL_CB_TIMES` is scoped to this command and prints the measured prefill time window on ROCm too. No tuning override is needed.
-- Check the active power profile during the measurement; save revision/build flags, model filename/size and existing provenance, cache/KV configuration, actual prompt/output counts, and memory/swap/OOM counters. Do not substitute HTTP timings for this native table.
+Save CSV, full frontier files, printed output, revision/build flags, model filename/size, active power profile and memory/swap counters. Leave sufficient RAM for the 2 GiB snapshot cap.
 
 ## GLM 5.3 Flash
 
