@@ -325,7 +325,7 @@ rocm: strix-halo
 # CUDA hosts.  Everything else mirrors `make test`.
 test-rocm:
 	$(MAKE) -B ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
-		test-session-state \
+		test-session-state test-tp-linux \
 		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args tests/test_prompt_prefix \
 		ds4 ds4-server ds4-bench ds4-agent \
 		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_engram.o $(ROCM_MMQ_OBJS)" \
@@ -334,7 +334,7 @@ test-rocm:
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
-	./ds4_test
+	./ds4_test --server
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
@@ -954,8 +954,10 @@ else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
 
+# These shared protocol fixtures construct the generic wire format directly.
+# Linux ROCm framing is covered separately by test-tp-linux.
 tests/test_tp_commands.o: tests/test_tp_commands.c ds4_tp.c ds4_tp.h ds4.h ds4_gpu_tp.h
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
+	$(CC) $(CFLAGS) -UDS4_ROCM_BUILD -I. -c -o $@ $<
 
 tests/test_tp_commands: tests/test_tp_commands.o $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -970,7 +972,7 @@ test-tp-linux: tests/test_tp_linux
 endif
 
 tests/test_tp_rdma.o: tests/test_tp_rdma.c ds4_tp.c ds4_tp.h ds4.h ds4_gpu_tp.h
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
+	$(CC) $(CFLAGS) -UDS4_ROCM_BUILD -I. -c -o $@ $<
 
 tests/test_tp_rdma: tests/test_tp_rdma.o $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -982,7 +984,7 @@ tests/test_tp_link: tests/test_tp_link.o $(CPU_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_tp_tcp.o: tests/test_tp_tcp.c ds4_tp.c ds4_tp.h ds4.h ds4_gpu_tp.h
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
+	$(CC) $(CFLAGS) -UDS4_ROCM_BUILD -I. -c -o $@ $<
 
 tests/test_tp_tcp: tests/test_tp_tcp.o $(filter-out ds4_tp.o,$(CPU_CORE_OBJS))
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)

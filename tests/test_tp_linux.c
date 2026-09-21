@@ -244,8 +244,28 @@ static void checkpoint_streams(void) {
     free(data);
 }
 
+static void backend_options(void) {
+    char err[256];
+    const ds4_engine_options valid = {.backend = DS4_BACKEND_CUDA,
+        .tp = {.role = DS4_TP_LEADER, .requested = true}};
+    assert(ds4_tp_validate_engine_options(&valid, err, sizeof(err)));
+    for (unsigned mode = 0; mode < 6; ++mode) {
+        ds4_engine_options opt = valid;
+        switch (mode) {
+        case 0: opt.backend = DS4_BACKEND_CPU; break;
+        case 1: opt.ssd_streaming = true; break;
+        case 2: opt.cuda_tensor_parallel = true; break;
+        case 3: opt.dspark = true; break;
+        case 4: opt.glm_mtp = true; break;
+        case 5: opt.mtp_path = "draft.gguf"; break;
+        }
+        assert(!ds4_tp_validate_engine_options(&opt, err, sizeof(err)));
+    }
+}
+
 int main(void) {
     assert(DS4_TP_PROTOCOL_VERSION==15);
+    backend_options();
     negotiation(); handshakes(); transfers(); failures(); cancellation(); checkpoint_streams();
     puts("Linux TP: negotiation, full-duplex TCP I/O, tails, canaries, generations and failures PASS");
     return 0;
