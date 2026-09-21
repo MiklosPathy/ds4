@@ -1066,7 +1066,7 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
         /* Query-B, including contiguous two-rank weight slices.
          * This numerical path rounds activations and decoded Q8 weights to
          * F16 before F32 accumulation; quality mode retains the F32 path. */
-        matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u><<<dim3(outputs / 256u, (rows + 63u) / 64u), 512u>>>(
+        matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 16u><<<dim3(outputs / 256u, (rows + 63u) / 64u), 512u>>>(
             (float *)out->ptr, weights, (const float *)in->ptr,
             rows, width, outputs, UINT64_C(40) * 34u);
     } else if (!g_quality_mode && rows == 2048u && ds4_rocm_is_gfx1151() &&
