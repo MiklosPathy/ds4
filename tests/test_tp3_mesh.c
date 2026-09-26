@@ -19,14 +19,9 @@ void ds4_vision_embedding_free(ds4_vision_embedding *embedding) {
 static float partial(int rank, uint64_t i, uint32_t salt) {
     /* Non-trivial magnitudes make the addition order observable. */
     const float scale = rank == 0 ? 1.0e8f : rank == 1 ? 1.0f : -1.0e8f;
-    return scale * (float)((i * 2654435761u + salt) % 1000u) / 7.0f + (float)rank * 0.1f;
-}
-
-/* volatile pins the rank order even under -ffast-math. */
-static float ordered_sum(float a, float b, float c) {
-    volatile float ab = a + b;
-    volatile float abc = ab + c;
-    return abc;
+    /* volatile stops FMA contraction, so every call site rounds alike. */
+    volatile float product = scale * ((float)((i * 2654435761u + salt) % 1000u) * 0.125f);
+    return product + (float)rank * 0.5f;
 }
 
 static uint64_t hash_floats(const float *v, uint64_t n) {
@@ -37,6 +32,13 @@ static uint64_t hash_floats(const float *v, uint64_t n) {
 }
 
 static int run_rank(int rank, int port) {
+    {
+        /* IEEE rank order: (2^24 + 1) - 2^24 == 0, while 2^24 + (1 - 2^24) == 1. */
+        const float a = 16777216.0f, b = 1.0f, c = -16777216.0f;
+        float got;
+        tp3_reduce(&got, &a, &b, &c, 1);
+        CHECK(got == 0.0f);
+    }
     ds4_tp_options opt = {
         .role = rank ? DS4_TP_WORKER : DS4_TP_LEADER,
         .listen_host = "127.0.0.1", .listen_port = port,
@@ -59,12 +61,13 @@ static int run_rank(int rank, int port) {
             float *out = (float *)(slab + ds4_tp_slab_out_offset(tp, layer, gate));
             float *in = (float *)(slab + ds4_tp_slab_in_offset(tp, layer, gate));
             const uint32_t salt = layer * 2u + gate;
-            for (uint64_t i = 0; i < 5120; i++) out[i] = partial(rank, i, salt);
+            float parts[3][5120], want[5120];
+            for (int r = 0; r < 3; r++)
+                for (uint64_t i = 0; i < 5120; i++) parts[r][i] = partial(r, i, salt);
+            memcpy(out, parts[rank], sizeof(parts[rank]));
             CHECK(ds4_tp_gate_exchange(tp, layer, gate, salt + 1u));
-            for (uint64_t i = 0; i < 5120; i++) {
-                const float want = ordered_sum(partial(0, i, salt), partial(1, i, salt), partial(2, i, salt));
-                CHECK(memcmp(&in[i], &want, sizeof(want)) == 0);
-            }
+            tp3_reduce(want, parts[0], parts[1], parts[2], 5120);
+            CHECK(memcmp(in, want, sizeof(want)) == 0);
             /* Every rank must hold bit-identical sums. */
             CHECK(ds4_tp_hash_check(tp, salt + 1u, hash_floats(in, 5120), err, sizeof(err)) == 1);
         }
@@ -76,13 +79,17 @@ static int run_rank(int rank, int port) {
         const uint64_t count = (uint64_t)rows[n] * 5120u;
         float *out = malloc(count * sizeof(float)), *in = malloc(count * sizeof(float));
         CHECK(out && in);
-        for (uint64_t i = 0; i < count; i++) out[i] = partial(rank, i, 1000u + n);
-        CHECK(ds4_tp_big_gate_exchange(tp, 39, 100u + n, out, in, count * sizeof(float)));
-        for (uint64_t i = 0; i < count; i++) {
-            const float want = ordered_sum(partial(0, i, 1000u + n), partial(1, i, 1000u + n),
-                                           partial(2, i, 1000u + n));
-            CHECK(memcmp(&in[i], &want, sizeof(want)) == 0);
+        float *parts[3];
+        for (int r = 0; r < 3; r++) {
+            parts[r] = malloc(count * sizeof(float));
+            CHECK(parts[r]);
+            for (uint64_t i = 0; i < count; i++) parts[r][i] = partial(r, i, 1000u + n);
         }
+        memcpy(out, parts[rank], count * sizeof(float));
+        CHECK(ds4_tp_big_gate_exchange(tp, 39, 100u + n, out, in, count * sizeof(float)));
+        tp3_reduce(parts[rank], parts[0], parts[1], parts[2], count); /* reuse as expected sum */
+        CHECK(memcmp(in, parts[rank], count * sizeof(float)) == 0);
+        for (int r = 0; r < 3; r++) free(parts[r]);
         free(out);
         free(in);
     }
