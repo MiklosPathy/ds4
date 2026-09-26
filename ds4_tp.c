@@ -2742,6 +2742,18 @@ static int tp3_exchange(ds4_tp *tp, const void *hdr, void *peer_hdr_buf,
     }
 }
 
+/* (r0 + r1) + r2 in IEEE order on every rank, independent of -ffast-math,
+ * so replicated state is bit-identical and matches a strict reference. */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-fast-math")))
+#endif
+static void tp3_reduce(float *dst, const float *a, const float *b, const float *c, uint64_t n) {
+#if defined(__clang__)
+#pragma float_control(precise, on)
+#endif
+    for (uint64_t i = 0; i < n; i++) dst[i] = (a[i] + b[i]) + c[i];
+}
+
 static int tp3_gate(ds4_tp *tp, uint32_t kind, uint32_t layer, uint32_t gate,
                     uint64_t seq, const void *out, void *in, uint64_t bytes,
                     uint64_t grace_ms) {
@@ -2782,10 +2794,7 @@ static int tp3_gate(ds4_tp *tp, uint32_t kind, uint32_t layer, uint32_t gate,
     const float *src[3];
     for (int r = 0; r < 3; r++)
         src[r] = r == tp->rank ? (const float *)out : (const float *)tp->peer_rx[r];
-    float *dst = in;
-    const uint64_t n = bytes / sizeof(float);
-    /* Same operand order on every rank: bit-identical replicated state. */
-    for (uint64_t i = 0; i < n; i++) dst[i] = (src[0][i] + src[1][i]) + src[2][i];
+    tp3_reduce(in, src[0], src[1], src[2], bytes / sizeof(float));
     if (profile) {
         /* Per kind: count, bytes, exchange and reduction seconds. */
         static double stats[4][4];
