@@ -49,6 +49,14 @@ int ds4_gpu_dsv41_attention_output_tp_batch(
         const void *model_map, uint64_t model_size,
         uint64_t out_a_offset, uint64_t out_b_offset,
         const ds4_gpu_tensor *heads, uint32_t n_tokens, uint32_t tp_rank);
+/* Same projection for any contiguous range of the eight output groups
+ * (three-rank TP owns 3/3/2 groups). */
+int ds4_gpu_dsv41_attention_output_tp_groups(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t out_b_offset,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens,
+        uint32_t group0, uint32_t groups);
 /* Adjacent-pair, unit-magnitude RoPE with the released V4.1 frequencies. */
 int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                       uint32_t rows, uint32_t start, bool compressed, bool inverse);

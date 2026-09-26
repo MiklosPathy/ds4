@@ -8613,12 +8613,29 @@ static const uint8_t *tensor_expert_bytes(
 /* TP sharding keeps full layers but restricts every routed-expert blob to
  * one contiguous rank range (rank 0 owns the lower expert ids, matching
  * ds4_tp_owns_expert in metal/moe.metal). */
+/* Contiguous routed-expert range owned by a TP rank. The pair keeps its
+ * historical split (rank 1 takes any odd remainder); three ranks own
+ * floor(n*r/3) .. floor(n*(r+1)/3). */
+static void tp_expert_shard_range(uint64_t n, int rank, int world,
+                                  uint64_t *first, uint64_t *count) {
+    if (world == 3) {
+        *first = n * (uint64_t)rank / 3u;
+        *count = n * (uint64_t)(rank + 1) / 3u - *first;
+        return;
+    }
+    const uint64_t low = n / 2;
+    *first = rank == 1 ? low : 0;
+    *count = rank == 1 ? n - low : low;
+}
+
 static DS4_MAYBE_UNUSED bool weights_model_map_sharded_spans(
         const ds4_weights *w,
         const ds4_model   *m,
         int                rank,
+        int                world,
         ds4_model_map_span_vec *spans) {
-    if (!w || !m || !spans || (rank != 0 && rank != 1)) return false;
+    if (!w || !m || !spans || rank < 0 || rank >= world ||
+        (world != 2 && world != 3)) return false;
     memset(spans, 0, sizeof(*spans));
     model_map_span_vec_include_one(spans, w->token_embd);
     for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
@@ -8634,10 +8651,8 @@ static DS4_MAYBE_UNUSED bool weights_model_map_sharded_spans(
             uint64_t in_dim = 0, out_dim = 0, row_bytes = 0;
             (void)tensor_expert_bytes(m, x, 0, &in_dim, &out_dim, &row_bytes);
             const uint64_t expert_bytes = out_dim * row_bytes;
-            const uint64_t low_experts = x->dim[2] / 2;
-            const uint64_t first_expert = rank == 1 ? low_experts : 0;
-            const uint64_t owned_experts = rank == 1 ?
-                x->dim[2] - low_experts : low_experts;
+            uint64_t first_expert = 0, owned_experts = 0;
+            tp_expert_shard_range(x->dim[2], rank, world, &first_expert, &owned_experts);
             const uint64_t owned_bytes = owned_experts * expert_bytes;
             const uint64_t lo = x->abs_offset + first_expert * expert_bytes;
             /* Kernels index experts from the blob base, so the owned range
@@ -40309,6 +40324,9 @@ typedef struct {
     uint64_t allocation_bytes;
     bool valid, streaming, encoder_resident, compact_carry, prefill_alias, quality;
     uint32_t tp_world, tp_rank;
+    /* This rank's contiguous attention output groups and their heads. */
+    uint32_t tp_group0, tp_groups, tp_head0, tp_heads;
+    bool tp_skip_logits;        /* three-rank workers: rank 0 owns the head */
     ds4_gpu_tensor *tp_logits_half;
     ds4_gpu_tensor **tp_out, **tp_in;
     ds4_imatrix_collector *imatrix;
@@ -40475,6 +40493,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     g->allocation_bytes = ds41_graph_bytes(ctx);
     g->streaming = streaming;
     g->tp_world = 1;
+    g->tp_groups = DS4_N_OUT_GROUP;
+    g->tp_heads = DS4_N_HEAD;
     g->token_map = malloc((size_t)DS4_N_VOCAB * sizeof(uint32_t));
     g->prefill_ids = malloc((size_t)(g->carry_cap ? g->carry_cap : g->prefill_cap) *
                             sizeof(*g->prefill_ids));
@@ -40597,6 +40617,25 @@ fail:
     return false;
 }
 #undef DS41_SCRATCH
+
+/* Split the output groups as evenly as possible: 4/4 for the pair, 3/3/2
+ * for three ranks. Each group owns DS4_N_HEAD / DS4_N_OUT_GROUP heads. */
+static void ds41_tp_set_split(ds41_gpu_graph *g, uint32_t world, uint32_t rank) {
+    const uint32_t groups = DS4_N_OUT_GROUP, base = groups / world, extra = groups % world;
+    const uint32_t heads_per_group = DS4_N_HEAD / DS4_N_OUT_GROUP;
+    g->tp_world = world;
+    g->tp_rank = rank;
+    g->tp_groups = base + (rank < extra ? 1u : 0u);
+    g->tp_group0 = rank * base + (rank < extra ? rank : extra);
+    g->tp_heads = g->tp_groups * heads_per_group;
+    g->tp_head0 = g->tp_group0 * heads_per_group;
+    g->tp_skip_logits = world == 3u && rank != 0u;
+}
+
+/* Rank that adds the shared expert into its routed partial. */
+static uint32_t ds41_shared_owner_rank(const ds41_gpu_graph *g, uint32_t il) {
+    return g->tp_world ? il % g->tp_world : 0u;
+}
 
 static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
@@ -40741,10 +40780,14 @@ static bool ds41_embed(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights 
 
 static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
                              uint32_t il, uint32_t gate) {
-    if (g->tp_world != 2) return true;
+    if (g->tp_world < 2) return true;
     const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + gate;
     if (!ds4_gpu_tensor_copy(g->tp_out[slot], 0, x, 0, (uint64_t)DS4_N_EMBD * 4u) ||
         !ds4_gpu_tp_gate_encode(il, gate)) return false;
+#ifdef DS4_ROCM_BUILD
+    /* The mesh transport already wrote the rank-ordered sum. */
+    if (g->tp_world == 3) return ds4_gpu_tp_add_tensor(x, g->tp_in[slot], NULL, DS4_N_EMBD) != 0;
+#endif
     ds4_gpu_tensor *first = g->tp_rank ? g->tp_in[slot] : g->tp_out[slot];
     ds4_gpu_tensor *second = g->tp_rank ? g->tp_out[slot] : g->tp_in[slot];
 #ifdef DS4_ROCM_BUILD
@@ -40763,13 +40806,14 @@ static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
 
 static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
                                    uint32_t il, uint32_t count) {
-    if (g->tp_world != 2) return true;
+    if (g->tp_world < 2) return true;
     /* Q is dead after attention; its expert-output alias is dead after the
      * routed reduction. Reuse it for the peer, without another large buffer. */
     ds4_gpu_tensor *peer = g->batch.q;
     const uint64_t bytes = (uint64_t)count * DS4_N_EMBD * sizeof(float);
     if (!ds4_gpu_tp_big_gate_encode(il, count, x, peer, bytes)) return false;
 #ifdef DS4_ROCM_BUILD
+    if (g->tp_world == 3) return ds4_gpu_tp_add_tensor(x, peer, NULL, count * DS4_N_EMBD) != 0;
     return ds4_gpu_tp_add_tensor(x, g->tp_rank ? peer : x,
         g->tp_rank ? x : peer, count * DS4_N_EMBD) != 0;
 #else
@@ -40780,7 +40824,7 @@ static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
 
 #ifdef DS4_ROCM_BUILD
 static bool ds41_tp_failed(const ds41_gpu_graph *g) {
-    return g->tp_world == 2u && ds4_gpu_tp_failed();
+    return g->tp_world >= 2u && ds4_gpu_tp_failed();
 }
 #endif
 
@@ -40806,8 +40850,8 @@ static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
                                const ds4_layer_weights *l) {
-    const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
-    const uint32_t group0 = g->tp_rank * groups;
+    const uint32_t groups = g->tp_groups;
+    const uint32_t group0 = g->tp_group0;
     uint64_t output_row;
     return tensor_nbytes(l->attn_output_a->type, 4096, &output_row) &&
         ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
@@ -40818,12 +40862,12 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l) {
 #ifdef DS4_ROCM_BUILD
-    if (g->tp_world == 2u)
+    if (g->tp_world >= 2u)
         return l->attn_output_a->type == DS4_TENSOR_Q8_0 &&
             l->attn_output_b->type == DS4_TENSOR_Q8_0 &&
-            ds4_gpu_dsv41_attention_output_tp_batch(g->block, g->low, m->map, m->size,
+            ds4_gpu_dsv41_attention_output_tp_groups(g->block, g->low, m->map, m->size,
                 l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
-                g->heads, 1u, g->tp_rank);
+                g->heads, 1u, g->tp_group0, g->tp_groups);
     if (l->attn_output_b->type == DS4_TENSOR_Q8_0)
         return
             ds4_gpu_dsv41_attention_output_batch(g->block, g->low, m->map, m->size,
@@ -40831,11 +40875,11 @@ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
     return g->tp_world == 1u && ds41_attention_low(g, m, l) &&
         ds41_matmul(g->block, m, l->attn_output_b, g->low, false);
 #else
-    const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
+    const uint32_t groups = g->tp_groups;
     if (!ds41_attention_low(g, m, l)) return false;
     return g->tp_world == 2 ?
         metal_graph_matmul_dense_quant_kslice(g->block, m, l->attn_output_b,
-            8192, (uint64_t)g->tp_rank * groups * 1024u,
+            8192, (uint64_t)g->tp_group0 * 1024u,
             (uint64_t)groups * 1024u, DS4_N_EMBD, g->low, 0) :
         ds41_matmul(g->block, m, l->attn_output_b, g->low, false);
 #endif
@@ -40946,11 +40990,11 @@ static bool ds41_attention_select(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_layer_weights *l) {
-    const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
+    const uint32_t q_dim = g->tp_heads * DS4_N_HEAD_DIM;
     return ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) &&
         ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
         ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr,
-                         g->tp_rank * q_dim, q_dim) &&
+                         g->tp_head0 * DS4_N_HEAD_DIM, q_dim) &&
         ds41_matmul(g->kv, m, l->attn_kv, g->norm, true) &&
         ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
 }
@@ -40960,8 +41004,8 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
-    const uint32_t heads = DS4_N_HEAD / g->tp_world;
-    const uint32_t head0 = g->tp_rank * heads;
+    const uint32_t heads = g->tp_heads;
+    const uint32_t head0 = g->tp_head0;
     if (!projected && !ds41_attention_project(g, m, l)) return false;
     if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
@@ -41030,7 +41074,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     uint64_t gate_row = 0, down_row = 0;
     if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
         !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return false;
-    const bool shared_owner = g->tp_world == 2 &&
+    const bool shared_owner = g->tp_world >= 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
@@ -41045,7 +41089,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
      * routed consumer joins the matching compact table and upload event. */
     if (g->streaming && !ds41_stream_selected_begin(g, m, l, il)) return false;
 #endif
-    const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
+    const bool shared_here = !shared_owner || g->tp_rank == ds41_shared_owner_rank(g, il);
     bool shared_queued = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (shared_owner && shared_here &&
@@ -41070,7 +41114,15 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
     bool routed_ok;
 #ifdef DS4_ROCM_BUILD
-    if (g->tp_world == 2u) {
+    if (g->tp_world == 3u) {
+        routed_ok = ds4_gpu_routed_moe_batch_owned_tensor(routed, g->gate, g->up, g->mid, g->experts,
+            m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+            l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, g->selected, g->route_weights,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, g->tp_rank * (DS4_N_EXPERT / 3u),
+            DS4_N_EXPERT / 3u, DS4_SWIGLU_CLAMP_EXP, g->norm, il, 1, NULL);
+    } else if (g->tp_world == 2u) {
         routed_ok = ds4_gpu_dsv41_routed_moe_tp_tensor(routed, g->gate, g->up, g->mid, g->experts,
                 m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                 l->ffn_down_exps->abs_offset, g->selected, g->route_weights,
@@ -41100,13 +41152,13 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     if (!routed_ok) return false;
     /* Keep the shared expert's BF16 boundary, then include it exactly once
      * in the existing F32 reduction. Alternate ownership across layers. */
-    if (shared_owner && g->tp_rank == (il & 1u) &&
+    if (shared_owner && g->tp_rank == ds41_shared_owner_rank(g, il) &&
         !ds4_gpu_add_tensor(routed, routed, g->shared, DS4_N_EMBD)) return false;
     return true;
 }
 
 static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
-    const bool shared_owner = g->tp_world == 2 &&
+    const bool shared_owner = g->tp_world >= 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     if (!ds41_sum_partial(g, routed, il, DS4_TP_GATE_FFN)) return false;
@@ -41121,7 +41173,9 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_weights *w, float *logits) {
-    if (!g->valid || !logits || !ds4_gpu_begin_commands()) return false;
+    if (!g->valid || !logits) return false;
+    if (g->tp_skip_logits) return true;
+    if (!ds4_gpu_begin_commands()) return false;
     bool ok = ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
               ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
               ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
@@ -41256,13 +41310,13 @@ static bool ds41_after_attention_batch(
 static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
                                          const ds4_layer_weights *l, uint32_t count) {
     ds41_prefill_row *b = &g->batch;
-    const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
+    const uint32_t q_dim = g->tp_heads * DS4_N_HEAD_DIM;
     return ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) &&
         ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
             l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&
         ds4_gpu_dsv41_quantize(b->qr, DS4_N_LORA_Q, count, DS4_V41_BF16) &&
         ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr,
-                               g->tp_rank * q_dim, q_dim, count) &&
+                               g->tp_head0 * DS4_N_HEAD_DIM, q_dim, count) &&
         ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, count, true) &&
         ds4_gpu_rms_norm_weight_rows_tensor(b->kv, b->kv, m->map, m->size,
             l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, count, DS4_RMS_EPS) &&
@@ -41390,9 +41444,9 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t first = previous < 128u - raw_start ? previous : 128u - raw_start;
     const uint32_t n_raw = previous + count;
     const uint64_t row_bytes = DS4_N_HEAD_DIM * sizeof(float);
-    const uint32_t heads = DS4_N_HEAD / g->tp_world;
+    const uint32_t heads = g->tp_heads;
     const uint64_t sinks = l->attn_sinks->abs_offset +
-        (uint64_t)g->tp_rank * heads * sizeof(float);
+        (uint64_t)g->tp_head0 * sizeof(float);
     ds41_prefill_row *b = &g->batch;
     if (!ds4_gpu_dsv41_rope(b->q, DS4_N_HEAD_DIM, heads, count, start, ratio != 0, false) ||
         !ds4_gpu_dsv41_rope(b->kv, DS4_N_HEAD_DIM, 1, count, start, ratio != 0, false) ||
@@ -41604,7 +41658,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     bool mid_f16 = false;
     return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
         ds41_route_batch(g, m, l, count) &&
-        ((shared_owner && g->tp_rank != (il & 1u)) ||
+        ((shared_owner && g->tp_rank != ds41_shared_owner_rank(g, il)) ||
         (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
         ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
         ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
@@ -41613,6 +41667,14 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))) &&
         (
 #ifdef DS4_ROCM_BUILD
+        g->tp_world == 3u ?
+        ds4_gpu_routed_moe_batch_owned_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+            m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+            l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, g->tp_rank * (DS4_N_EXPERT / 3u),
+            DS4_N_EXPERT / 3u, DS4_SWIGLU_CLAMP_EXP, b->norm, il, count, &mid_f16) :
         g->tp_world == 2u ?
         ds4_gpu_dsv41_routed_moe_tp_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
@@ -41635,7 +41697,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
             il, count, &mid_f16, true)) &&
-        (!shared_owner || g->tp_rank != (il & 1u) ||
+        (!shared_owner || g->tp_rank != ds41_shared_owner_rank(g, il) ||
             ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
         ds41_sum_partial_batch(g, b->routed, il, count);
 }
@@ -41670,7 +41732,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          !g->image_count && !g_expert_profile.active &&
          !getenv("DS4_ROCM_DISABLE_V41_RESIDENT_QUEUE")) ||
 #endif
-        (g->tp_world == 2 && !g->imatrix &&
+        (g->tp_world >= 2 && !g->imatrix &&
          !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"));
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
@@ -41789,7 +41851,7 @@ static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_tp_batch_enabled(const ds41_gpu_graph *g) {
-    return g->tp_world == 1 || (g->tp_world == 2 &&
+    return g->tp_world == 1 || (g->tp_world >= 2 &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_ATTN") &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_CORE") &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_MOE") &&
@@ -41802,7 +41864,7 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
         getenv("DS4_METAL_DISABLE_V41_LAYER_PREFILL")) return 1;
     uint32_t minimum = 256u;
 #if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
-    minimum = g->tp_world == 2 &&
+    minimum = g->tp_world >= 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SMALL_PREFILL") ? 32u : 256u;
 #endif
     /* Resident appends do not pay for an SSD layer sweep. In particular,
@@ -42470,10 +42532,16 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     ok = ds41_attention(&row, m, l, il, true);
                 }
                 DS41_STAGE("attention core/index");
-                if (ok && g->tp_world == 2) {
+                if (ok && g->tp_world >= 2) {
+#ifdef DS4_ROCM_BUILD
+                    ok = ds4_gpu_dsv41_attention_output_tp_groups(g->batch.block, g->batch.low,
+                        m->map, m->size, l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
+                        g->batch.heads, count, g->tp_group0, g->tp_groups) &&
+#else
                     ok = ds4_gpu_dsv41_attention_output_tp_batch(g->batch.block, g->batch.low,
                         m->map, m->size, l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
                         g->batch.heads, count, g->tp_rank) &&
+#endif
                         ds41_sum_partial_batch(g, g->batch.block, il, count) &&
                         ds4_gpu_dsv41_quantize(g->batch.block, DS4_N_EMBD, count, DS4_V41_BF16);
                 } else
@@ -42675,7 +42743,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         (uint64_t)rows * (width) * sizeof(float))) != NULL;
     DS41_PREFILL_ROWS(DS41_SESSION_VIEW)
 #undef DS41_SESSION_VIEW
-    const uint64_t head_bytes = (uint64_t)(DS4_N_HEAD / g->tp_world) * DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t head_bytes = (uint64_t)g->tp_heads * DS4_N_HEAD_DIM * sizeof(float);
     for (int i = 0; ok && i < count; i++) {
         queries[i] = ds4_gpu_tensor_view(g->batch.q, (uint64_t)i * head_bytes, head_bytes);
         heads[i] = ds4_gpu_tensor_view(g->batch.heads, (uint64_t)i * head_bytes, head_bytes);
@@ -42852,6 +42920,7 @@ typedef struct {
     uint64_t eval_seq;          /* leader: mirrored eval counter */
     uint64_t next_session_id;   /* leader: stable worker-session handle */
     int rank;
+    int world;                  /* 2, or 3 for --tensor-parallel3 */
     bool vocab_split;           /* DeepSeek: logits halves cross the wire */
     bool active;
 } ds4_engine_tp_state;
@@ -69747,10 +69816,10 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
  * rank will ever read is pre-faulted here. */
 static void model_warm_weights_sharded(const ds4_model *m,
                                        const ds4_weights *w,
-                                       int rank) {
+                                       int rank, int world) {
     typedef struct { uint64_t off, len; } skip_range;
-    if (rank != 0 && rank != 1) return;
-    skip_range *skips = xmalloc((size_t)DS4_N_LAYER * 3 * sizeof(*skips));
+    if (rank < 0 || rank >= world || (world != 2 && world != 3)) return;
+    skip_range *skips = xmalloc((size_t)DS4_N_LAYER * 6 * sizeof(*skips));
     uint32_t n_skips = 0;
     uint64_t skip_bytes = 0;
     for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
@@ -69763,14 +69832,19 @@ static void model_warm_weights_sharded(const ds4_model *m,
             uint64_t in_dim = 0, out_dim = 0, row_bytes = 0;
             (void)tensor_expert_bytes(m, x, 0, &in_dim, &out_dim, &row_bytes);
             const uint64_t expert_bytes = out_dim * row_bytes;
-            const uint64_t total_bytes = x->dim[2] * expert_bytes;
-            const uint64_t low_bytes = (x->dim[2] / 2) * expert_bytes;
-            /* Unowned range: rank 0 owns the low ids; rank 1 owns the high
-             * ids and takes any odd-count remainder. */
-            skips[n_skips].off = x->abs_offset + (rank == 0 ? low_bytes : 0);
-            skips[n_skips].len = rank == 0 ? total_bytes - low_bytes : low_bytes;
-            skip_bytes += skips[n_skips].len;
-            n_skips++;
+            uint64_t first = 0, owned = 0;
+            tp_expert_shard_range(x->dim[2], rank, world, &first, &owned);
+            /* Skip the unowned ids below and above this rank's range. */
+            if (first) {
+                skips[n_skips].off = x->abs_offset;
+                skips[n_skips].len = first * expert_bytes;
+                skip_bytes += skips[n_skips++].len;
+            }
+            if (first + owned < x->dim[2]) {
+                skips[n_skips].off = x->abs_offset + (first + owned) * expert_bytes;
+                skips[n_skips].len = (x->dim[2] - first - owned) * expert_bytes;
+                skip_bytes += skips[n_skips++].len;
+            }
         }
     }
     /* File order should already ascend, but do not rely on it. */
@@ -71605,7 +71679,24 @@ static int ds4_engine_open_internal(ds4_engine **out,
                  load_output,
                  load_output_optional);
 #ifdef DS4_ROCM_BUILD
-    if (opt->tp.role != DS4_TP_NONE) {
+    if (opt->tp.role != DS4_TP_NONE && opt->tp.world == 3) {
+        /* The three-rank path uses the generic owned-expert dispatch. */
+        for (uint32_t il = 0; il < DS4_N_LAYER; ++il) {
+            const ds4_layer_weights *l = &e->weights.layer[il];
+            const bool q4 = l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+                l->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+                l->ffn_down_exps->type == DS4_TENSOR_Q4_K;
+            const bool q2 = l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+                l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+                l->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+            if ((!q4 && !q2) || DS4_N_EXPERT % 3u != 0u ||
+                l->attn_output_a->type != DS4_TENSOR_Q8_0 ||
+                l->attn_output_b->type != DS4_TENSOR_Q8_0) {
+                fprintf(stderr, "ds4: --tensor-parallel3 requires Q4_K or IQ2_XXS/Q2_K experts and Q8_0 attention output weights (layer %u)\n", il);
+                ds4_engine_close(e); *out = NULL; return 1;
+            }
+        }
+    } else if (opt->tp.role != DS4_TP_NONE) {
         for (uint32_t il = 0; il < DS4_N_LAYER; ++il) {
             const ds4_layer_weights *l = &e->weights.layer[il];
             if (l->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
@@ -71641,7 +71732,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const bool tp_shard =
         opt->tp.role != DS4_TP_NONE &&
         !e->ssd_streaming;
-    const int tp_shard_rank = opt->tp.role == DS4_TP_WORKER ? 1 : 0;
+    const int tp_shard_world = opt->tp.world == 3 ? 3 : 2;
+    const int tp_shard_rank = opt->tp.role != DS4_TP_WORKER ? 0 :
+        tp_shard_world == 3 ? opt->tp.rank : 1;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (tp_shard && (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 ||
         (gpu_cfg && gpu_cfg->n_gpus > 1) || opt->quality)) {
@@ -71683,7 +71776,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (tp_shard) {
         ds4_model_map_span_vec shard_spans;
         if (weights_model_map_sharded_spans(&e->weights, &e->model,
-                                            tp_shard_rank, &shard_spans)) {
+                                            tp_shard_rank, tp_shard_world, &shard_spans)) {
             g_tp_shard_model_bytes =
                 model_map_span_vec_total_bytes(&shard_spans);
             free(shard_spans.v);
@@ -72498,7 +72591,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         } else if (tp_shard) {
             ds4_model_map_span_vec spans;
             if (!weights_model_map_sharded_spans(&e->weights, &e->model,
-                                                 tp_shard_rank, &spans)) {
+                                                 tp_shard_rank, tp_shard_world, &spans)) {
                 fprintf(stderr, "ds4: sharded model span build failed\n");
                 ds4_engine_close(e);
                 *out = NULL;
@@ -72517,8 +72610,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
             load_span_count = spans.len;
             e->startup_model_span_bytes = span_bytes;
             fprintf(stderr,
-                    "ds4: TP expert shard (rank %d): mapping %u spans, %.2f GiB of %.2f GiB\n",
-                    tp_shard_rank,
+                    "ds4: TP expert shard (rank %d of %d): mapping %u spans, %.2f GiB of %.2f GiB\n",
+                    tp_shard_rank, tp_shard_world,
                     spans.len,
                     (double)span_bytes / 1073741824.0,
                     (double)(e->model.size - e->model.tensor_data_pos) / 1073741824.0);
@@ -72555,7 +72648,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
             ) {
             model_warm_weights_sharded(&e->model, &e->weights,
-                                       tp_shard_rank);
+                                       tp_shard_rank, tp_shard_world);
         }
         const bool support_model_runtime_ready =
             e->mtp_ready ||
@@ -73569,22 +73662,25 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     g_tp_block_ctx = tp;
 #endif
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
-    /* Reuse the existing half-logit frames for V4.1 on CUDA as well. */
-    e->tp.vocab_split = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4
+    e->tp.world = ds4_tp_world(tp);
+    /* Reuse the existing half-logit frames for V4.1 on CUDA as well. The
+     * three-rank mesh keeps the whole head on rank 0 instead. */
+    e->tp.vocab_split = e->tp.world == 2 && (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4
 #ifdef DS4_ROCM_BUILD
         || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41
 #endif
 #ifndef DS4_ROCM_BUILD
         || (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && e->backend == DS4_BACKEND_CUDA)
 #endif
-        ;
+        );
     e->tp.ctx = tp;
     e->tp.rank = ds4_tp_rank(tp);
     e->tp.eval_seq = 0;
     e->tp.active = true;
     ds4_log(stderr, DS4_LOG_OK,
-            "tensor parallelism bound: rank %d, 50/50 expert split, %s transport",
-            e->tp.rank, ds4_tp_transport_name(tp));
+            "tensor parallelism bound: rank %d of %d, %s expert split, %s transport",
+            e->tp.rank, e->tp.world, e->tp.world == 3 ? "1/3" : "50/50",
+            ds4_tp_transport_name(tp));
     return 1;
 fail:
     ds4_engine_tp_unbind(e);
@@ -73866,8 +73962,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->ds41_graph_ready = true;
         s->ds41_graph.quality = e->quality;
         if (e->tp.active) {
-            s->ds41_graph.tp_world = 2;
-            s->ds41_graph.tp_rank = (uint32_t)e->tp.rank;
+            ds41_tp_set_split(&s->ds41_graph, (uint32_t)e->tp.world, (uint32_t)e->tp.rank);
             s->ds41_graph.tp_out = e->tp.out_views;
             s->ds41_graph.tp_in = e->tp.in_views;
 #ifdef DS4_ROCM_BUILD
@@ -73883,9 +73978,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                     ds41_graph_free(g); free(s); return 1; \
                 } \
             } while (0)
-                DS41_TP_ROW_VIEW(q, DS4_N_HEAD / 2u * DS4_N_HEAD_DIM);
-                DS41_TP_ROW_VIEW(heads, DS4_N_HEAD / 2u * DS4_N_HEAD_DIM);
-                DS41_TP_ROW_VIEW(low, DS4_N_OUT_GROUP / 2u * DS4_N_LORA_O);
+                DS41_TP_ROW_VIEW(q, g->tp_heads * DS4_N_HEAD_DIM);
+                DS41_TP_ROW_VIEW(heads, g->tp_heads * DS4_N_HEAD_DIM);
+                DS41_TP_ROW_VIEW(low, g->tp_groups * DS4_N_LORA_O);
 #undef DS41_TP_ROW_VIEW
             }
 #endif

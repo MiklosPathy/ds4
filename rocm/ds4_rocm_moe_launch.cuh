@@ -2131,7 +2131,12 @@ static int routed_moe_launch(
         if (ok && !direct_iq2_down_done && !use_atomic_down &&
             !use_direct_down_sum6 && !use_iq2_q2_float_down) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
-            moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+            if (q4k_path) {
+                moe_sum_owned_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr,
+                    (const int32_t *)selected_exec->ptr, out_dim, n_expert, n_tokens);
+            } else {
+                moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+            }
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
         }
         if (ok && compact_selected) ok = cuda_stream_selected_mark_inflight();
@@ -2882,6 +2887,70 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              selected, weights, n_total_expert, n_expert, clamp, x, layer_index, 1,
                              force_resident);
 }
+/* Keep this rank's contiguous expert range, rebased to its first expert.
+ * Q4_K kernels skip foreign slots; other layouts compute a zero-weight
+ * slot against local expert 0, exactly like the CUDA owned path. */
+__global__ static void moe_filter_owned_pairs_kernel(
+        int32_t *selected, float *weights, uint64_t pair_count,
+        uint32_t n_total_expert, uint32_t expert_base, uint32_t expert_count,
+        int32_t foreign_id) {
+    const uint64_t pair = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (pair >= pair_count) return;
+    const int32_t expert_i = selected[pair];
+    if (expert_i >= 0 && (uint32_t)expert_i < n_total_expert &&
+        (uint32_t)expert_i >= expert_base &&
+        (uint32_t)expert_i - expert_base < expert_count) {
+        selected[pair] = expert_i - (int32_t)expert_base;
+    } else {
+        selected[pair] = foreign_id;
+        weights[pair] = 0.0f;
+    }
+}
+
+extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert,
+        uint32_t resident_expert_base, uint32_t resident_expert_count,
+        float clamp, const ds4_gpu_tensor *x, uint32_t layer_index,
+        uint32_t n_tokens, bool *mid_is_f16) {
+    if (mid_is_f16) *mid_is_f16 = false;
+    if (!selected || !weights || n_tokens == 0u || n_expert == 0u ||
+        n_total_expert == 0u || resident_expert_count == 0u ||
+        gate_expert_bytes == 0u || down_expert_bytes == 0u ||
+        resident_expert_base >= n_total_expert ||
+        resident_expert_count > n_total_expert - resident_expert_base) return 0;
+    const uint64_t pair_count = (uint64_t)n_tokens * n_expert;
+    if (pair_count > UINT32_MAX ||
+        selected->bytes < pair_count * sizeof(int32_t) ||
+        weights->bytes < pair_count * sizeof(float)) return 0;
+    const uint64_t gate_shift = (uint64_t)resident_expert_base * gate_expert_bytes;
+    const uint64_t down_shift = (uint64_t)resident_expert_base * down_expert_bytes;
+    if (gate_offset > model_size || gate_shift > model_size - gate_offset ||
+        up_offset > model_size || gate_shift > model_size - up_offset ||
+        down_offset > model_size || down_shift > model_size - down_offset) return 0;
+    const int32_t foreign = gate_type == 12u && down_type == 12u ? DS4_ROCM_MOE_SKIP_EXPERT : -1;
+    moe_filter_owned_pairs_kernel<<<(uint32_t)((pair_count + 255u) / 256u), 256>>>(
+        (int32_t *)selected->ptr, (float *)weights->ptr, pair_count,
+        n_total_expert, resident_expert_base, resident_expert_count, foreign);
+    if (!cuda_ok(cudaGetLastError(), "owned routed_moe pair filter")) return 0;
+    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+                             gate_offset + gate_shift, up_offset + gate_shift,
+                             down_offset + down_shift, gate_type, down_type,
+                             gate_expert_bytes, gate_row_bytes,
+                             down_expert_bytes, down_row_bytes,
+                             expert_in_dim, expert_mid_dim, out_dim,
+                             selected, weights, resident_expert_count, n_expert,
+                             clamp, x, layer_index, n_tokens, true);
+}
+
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16, bool force_resident) {
     if (mid_is_f16) *mid_is_f16 = false;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,

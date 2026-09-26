@@ -1,3 +1,8 @@
+/* Owned-expert tensor parallelism marks another rank's routed slots with
+ * this id. Q4_K routed kernels and the pair sort skip such slots; every
+ * other path clamps negative ids to expert 0 and relies on a zero weight. */
+#define DS4_ROCM_MOE_SKIP_EXPERT INT32_MIN
+
 // DS4 ROCm routed-MoE quantization/device helpers and kernels.
 //
 // Included from the ROCm backend translation unit before
@@ -1300,6 +1305,7 @@ __global__ static void moe_count_sorted_pairs_kernel(
     uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
     if (pair >= pair_count) return;
     int32_t expert_i = selected[pair];
+    if (expert_i == DS4_ROCM_MOE_SKIP_EXPERT) return;
     if (expert_i < 0) expert_i = 0;
     if ((uint32_t)expert_i >= n_total_expert) return;
     atomicAdd(counts + (uint32_t)expert_i, 1u);
@@ -1330,6 +1336,7 @@ __global__ static void moe_scatter_sorted_pairs_kernel(
     uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
     if (pair >= pair_count) return;
     int32_t expert_i = selected[pair];
+    if (expert_i == DS4_ROCM_MOE_SKIP_EXPERT) return;
     if (expert_i < 0) expert_i = 0;
     if ((uint32_t)expert_i >= n_total_expert) return;
     uint32_t pos = atomicAdd(cursors + (uint32_t)expert_i, 1u);
@@ -1349,6 +1356,7 @@ __global__ static void moe_scatter_sorted_pairs_deterministic_kernel(
     uint32_t pos = offsets[expert];
     for (uint32_t pair = 0; pair < pair_count; pair++) {
         int32_t expert_i = selected[pair];
+        if (expert_i == DS4_ROCM_MOE_SKIP_EXPERT) continue;
         if (expert_i < 0) expert_i = 0;
         if ((uint32_t)expert_i == expert) sorted_pairs[pos++] = pair;
     }
@@ -2785,6 +2793,17 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     uint32_t tok = pair / n_expert;
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i == DS4_ROCM_MOE_SKIP_EXPERT) {
+        /* Another rank owns this slot; its down input must be exactly zero. */
+        for (uint32_t rr = 0; lane == 0 && rr < 4u; rr++) {
+            const uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+            if (row >= expert_mid_dim) continue;
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            if (write_aux) gate_out[off] = up_out[off] = 0.0f;
+            mid_out[off] = 0.0f;
+        }
+        return;
+    }
     if (expert_i < 0) expert_i = 0;
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
@@ -3224,6 +3243,7 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
     for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
         if (slot >= n_expert) continue;
         int32_t expert_i = selected[slot];
+        if (expert_i == DS4_ROCM_MOE_SKIP_EXPERT) continue;
         if (expert_i < 0) expert_i = 0;
         const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
         const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
@@ -3310,6 +3330,10 @@ __global__ static void moe_down_q4K_qwarp32_kernel(
     uint32_t tok = pair / n_expert;
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i == DS4_ROCM_MOE_SKIP_EXPERT) {
+        if (lane == 0) down_out[(uint64_t)pair * out_dim + row] = 0.0f;
+        return;
+    }
     if (expert_i < 0) expert_i = 0;
     const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
@@ -4016,6 +4040,22 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
     uint32_t row = gid - (uint64_t)tok * out_dim;
     float acc = 0.0f;
     for (uint32_t e = 0; e < n_expert; e++) acc += down[((uint64_t)tok * n_expert + e) * out_dim + row];
+    out[gid] = acc;
+}
+
+/* Skipped (unowned) pairs never write their down rows. */
+__global__ static void moe_sum_owned_kernel(float *out, const float *down, const int32_t *selected,
+                                            uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (gid >= n) return;
+    uint32_t tok = gid / out_dim;
+    uint32_t row = gid - (uint64_t)tok * out_dim;
+    float acc = 0.0f;
+    for (uint32_t e = 0; e < n_expert; e++) {
+        const uint64_t pair = (uint64_t)tok * n_expert + e;
+        if (selected[pair] != DS4_ROCM_MOE_SKIP_EXPERT) acc += down[pair * out_dim + row];
+    }
     out[gid] = acc;
 }
 

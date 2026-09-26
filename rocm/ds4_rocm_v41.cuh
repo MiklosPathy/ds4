@@ -1062,8 +1062,9 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
         v41_q8_f32_blocks4_kernel<<<(outputs + 7u) / 8u, 256u>>>(
             (float *)out->ptr, weights, (const float *)in->ptr,
             width, outputs, (uint64_t)(width / 32u) * 34u);
-    } else if (!g_quality_mode && width == 1280u && (outputs == 32768u || outputs == 16384u) && rows >= 32u && rows <= 2048u && ds4_rocm_is_gfx1151()) {
-        /* Query-B, including contiguous two-rank weight slices.
+    } else if (!g_quality_mode && width == 1280u && (outputs == 32768u || outputs == 16384u ||
+               outputs == 12288u || outputs == 8192u) && rows >= 32u && rows <= 2048u && ds4_rocm_is_gfx1151()) {
+        /* Query-B, including contiguous two- and three-rank weight slices.
          * This numerical path rounds activations and decoded Q8 weights to
          * F16 before F32 accumulation; quality mode retains the F32 path. */
         matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 16u><<<dim3(outputs / 256u, (rows + 63u) / 64u), 512u>>>(
@@ -1277,61 +1278,80 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
     return cuda_ok(cudaGetLastError(), "V4.1 attention output projection");
 }
 
-extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+extern "C" int ds4_gpu_dsv41_attention_output_tp_groups(ds4_gpu_tensor *out, ds4_gpu_tensor *low,
         const void *model_map, uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset,
-        const ds4_gpu_tensor *heads, uint32_t n_tokens, uint32_t tp_rank) {
-    /* Heads and low rows are packed for this rank. Output-B keeps its
-     * original 8192-column physical row stride while consuming 4096 columns. */
-    const uint64_t a_bytes = UINT64_C(4096) * 128u * 34u;
+        const ds4_gpu_tensor *heads, uint32_t n_tokens, uint32_t group0, uint32_t groups) {
+    /* Heads and low rows are packed for this rank's contiguous output
+     * groups. Output-B keeps its original 8192-column physical row stride
+     * while consuming this rank's groups * 1024 columns. */
+    const uint64_t group_a_bytes = UINT64_C(1024) * 128u * 34u;
     const uint64_t b_bytes = UINT64_C(5120) * 256u * 34u;
-    if (tp_rank > 1u || !model_map || !n_tokens ||
-        !cuda_model_range_fits(model_size, out_a_offset, 2u * a_bytes) ||
+    const uint32_t width = groups * 1024u;
+    if (!groups || group0 >= 8u || groups > 8u - group0 || !model_map || !n_tokens ||
+        !cuda_model_range_fits(model_size, out_a_offset, 8u * group_a_bytes) ||
         !cuda_model_range_fits(model_size, out_b_offset, b_bytes) ||
-        !cuda_tensor_has_elems2(heads, n_tokens, 16384u, 4u) ||
-        !cuda_tensor_has_elems2(low, n_tokens, 4096u, 4u) ||
+        !cuda_tensor_has_elems2(heads, n_tokens, groups * 4096u, 4u) ||
+        !cuda_tensor_has_elems2(low, n_tokens, width, 4u) ||
         !cuda_tensor_has_elems2(out, n_tokens, 5120u, 4u)) return 0;
     const unsigned char *a = (const unsigned char *)cuda_model_range_ptr(model_map,
-        out_a_offset + tp_rank * a_bytes, a_bytes, "V4.1 TP attn_out_a");
+        out_a_offset + group0 * group_a_bytes, groups * group_a_bytes, "V4.1 TP attn_out_a");
     const unsigned char *b = (const unsigned char *)cuda_model_range_ptr(model_map,
         out_b_offset, b_bytes, "V4.1 TP attn_out_b");
     if (!a || !b) return 0;
-    b += (uint64_t)tp_rank * 128u * 34u;
+    b += (uint64_t)group0 * 32u * 34u;
+    const bool wmma = !g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151() &&
+        (groups == 4u || groups == 3u || groups == 2u);
     if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
-        v41_grouped_q8_f32_blocks4_kernel<<<512u, 256u>>>(
-            (float *)low->ptr, a, (const float *)heads->ptr, 4096, 1024, 4);
-    } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
-        v41_grouped_q8_f32_wmma_rowtile_kernel<128u, 8u, 4u><<<dim3(8u, (n_tokens + 63u) / 64u, 4u), 256u>>>(
-            (float *)low->ptr, a, (const float *)heads->ptr,
-            n_tokens, 4096u, 1024u, UINT64_C(128) * 34u);
+        v41_grouped_q8_f32_blocks4_kernel<<<groups * 128u, 256u>>>(
+            (float *)low->ptr, a, (const float *)heads->ptr, 4096, 1024, (int)groups);
+    } else if (wmma) {
+        const dim3 grid(8u, (n_tokens + 63u) / 64u, groups);
+        if (groups == 4u)
+            v41_grouped_q8_f32_wmma_rowtile_kernel<128u, 8u, 4u><<<grid, 256u>>>(
+                (float *)low->ptr, a, (const float *)heads->ptr, n_tokens, 4096u, 1024u, UINT64_C(128) * 34u);
+        else if (groups == 3u)
+            v41_grouped_q8_f32_wmma_rowtile_kernel<128u, 8u, 3u><<<grid, 256u>>>(
+                (float *)low->ptr, a, (const float *)heads->ptr, n_tokens, 4096u, 1024u, UINT64_C(128) * 34u);
+        else
+            v41_grouped_q8_f32_wmma_rowtile_kernel<128u, 8u, 2u><<<grid, 256u>>>(
+                (float *)low->ptr, a, (const float *)heads->ptr, n_tokens, 4096u, 1024u, UINT64_C(128) * 34u);
     } else if (n_tokens >= 32u && ds4_rocm_is_gfx1151()) {
         cuda_launch_grouped_q8_a_sharedx((float *)low->ptr, a, (const float *)heads->ptr,
-            n_tokens, 4u, 128u, 1024u, 128u * 34u, 8u, 8u, 8u);
+            n_tokens, groups, 128u, 1024u, 128u * 34u, 8u, 8u, 8u);
     } else {
-        grouped_q8_0_a_f32_batch_warp8_kernel<<<dim3(512u, n_tokens), 256>>>(
+        grouped_q8_0_a_f32_batch_warp8_kernel<<<dim3(groups * 128u, n_tokens), 256>>>(
             (float *)low->ptr, a, (const float *)heads->ptr,
-            4096u, 1024u, 4u, n_tokens, 128u);
+            4096u, 1024u, groups, n_tokens, 128u);
     }
     if (!cuda_ok(cudaGetLastError(), "V4.1 TP attention low projection") ||
-        !ds4_gpu_dsv41_quantize(low, 4096u, n_tokens, DS4_V41_BF16)) return 0;
+        !ds4_gpu_dsv41_quantize(low, width, n_tokens, DS4_V41_BF16)) return 0;
     if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
         v41_q8_f32_blocks4_kernel<<<640u, 256u>>>(
             (float *)out->ptr, b, (const float *)low->ptr,
-            4096u, 5120u, UINT64_C(256) * 34u);
+            width, 5120u, UINT64_C(256) * 34u);
     } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
         matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u><<<dim3(40u, (n_tokens + 63u) / 64u), 256u>>>(
             (float *)out->ptr, b, (const float *)low->ptr,
-            n_tokens, 4096u, 5120u, UINT64_C(256) * 34u);
+            n_tokens, width, 5120u, UINT64_C(256) * 34u);
     } else if (n_tokens >= 32u && ds4_rocm_is_gfx1151()) {
         cuda_launch_q8_batch_sharedx((float *)out->ptr, b, (const float *)low->ptr,
-            128u, 5120u, n_tokens, 256u * 34u, 8u, n_tokens <= 2048u ? 16u : 8u, 8u);
+            groups * 32u, 5120u, n_tokens, 256u * 34u, 8u, n_tokens <= 2048u ? 16u : 8u, 8u);
     } else {
         /* This scalar kernel accepts separate input length and weight stride;
-         * its column guard excludes the unowned half of each physical row. */
+         * its column guard excludes the unowned groups of each physical row. */
         matmul_q8_0_f32_batch_warp8_kernel<<<dim3(640u, n_tokens), 256>>>(
             (float *)out->ptr, b, (const float *)low->ptr,
-            4096u, 5120u, n_tokens, 256u);
+            width, 5120u, n_tokens, 256u);
     }
     return cuda_ok(cudaGetLastError(), "V4.1 TP attention output projection");
+}
+
+extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(ds4_gpu_tensor *out, ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens, uint32_t tp_rank) {
+    if (tp_rank > 1u) return 0;
+    return ds4_gpu_dsv41_attention_output_tp_groups(out, low, model_map, model_size,
+        out_a_offset, out_b_offset, heads, n_tokens, tp_rank * 4u, 4u);
 }
 
 /* Staged correctness reference. Validate global IDs before any pointer-table

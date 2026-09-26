@@ -237,6 +237,14 @@ struct ds4_tp {
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma rdma;
 #endif
+    /* --tensor-parallel3 mesh. The leader keeps one control socket per
+     * worker (control_fd aliases ctl_fds[1]); every rank keeps one data
+     * socket per peer, indexed by peer rank. */
+    int world;
+    int ctl_fds[3];
+    int peer_fds[3];
+    uint8_t *peer_rx[3];
+    uint64_t peer_rx_bytes;
 };
 
 /* ------------------------------------------------------------------------
@@ -488,6 +496,36 @@ static int tp_read_frame_header(int fd, uint32_t *type, uint32_t *bytes) {
     return 1;
 }
 
+/* Leader control traffic reaches every worker; workers talk to the leader. */
+static int tp_ctl_send(ds4_tp *tp, uint32_t type, const void *payload, uint32_t bytes) {
+    if (tp->world == 3 && tp->rank == 0) {
+        for (int r = 1; r <= 2; r++)
+            if (!tp_send_frame(tp->ctl_fds[r], type, payload, bytes)) return 0;
+        return 1;
+    }
+    return tp_send_frame(tp->control_fd, type, payload, bytes);
+}
+
+static int tp_ctl_write(ds4_tp *tp, const void *buf, size_t len) {
+    if (tp->world == 3 && tp->rank == 0) {
+        for (int r = 1; r <= 2; r++)
+            if (!tp_write_full(tp->ctl_fds[r], buf, len)) return 0;
+        return 1;
+    }
+    return tp_write_full(tp->control_fd, buf, len);
+}
+
+/* Control sockets the leader reads replies from, in rank order. */
+static int tp_ctl_reply_fds(const ds4_tp *tp, int fds[2]) {
+    if (tp->world == 3 && tp->rank == 0) {
+        fds[0] = tp->ctl_fds[1];
+        fds[1] = tp->ctl_fds[2];
+        return 2;
+    }
+    fds[0] = tp->control_fd;
+    return 1;
+}
+
 /* ------------------------------------------------------------------------
  * Options and CLI.
  * --------------------------------------------------------------------- */
@@ -503,6 +541,8 @@ void ds4_tp_usage(FILE *fp) {
         "  --transport <auto|rdma|tcp> Gate transport (default auto).\n"
         "  --rdma-device <name>        Select a verbs device such as rdma_en1.\n"
         "  --rdma-gid-index <n>        Select the local verbs GID index.\n"
+        "  --tensor-parallel3          V4.1 ROCm: three ranks in a full TCP mesh (1/3 experts each).\n"
+        "  --tp-rank <1|2>             Worker rank for --tensor-parallel3.\n"
         "  --tensor-parallel-token-prefill\n"
         "                              GLM diagnostic: prefill one token at a time.\n"
         "  --debug-hash <n>            Cross-check hidden state every n tokens.\n");
@@ -523,6 +563,19 @@ int ds4_tp_parse_cli_arg(
     int i = *index;
     if (!strcmp(arg, "--tensor-parallel")) {
         opt->requested = true;
+    } else if (!strcmp(arg, "--tensor-parallel3")) {
+        opt->requested = true;
+        opt->world = 3;
+    } else if (!strcmp(arg, "--tp-rank")) {
+        if (i + 1 >= argc) goto missing;
+        char *end = NULL;
+        errno = 0;
+        long value = strtol(argv[++i], &end, 10);
+        if (errno || !end || *end || value < 1 || value > 2) {
+            tp_set_err(err, errlen, "invalid --tp-rank %s (expected 1 or 2)", argv[i]);
+            return DS4_TP_CLI_ERROR;
+        }
+        opt->rank = (int)value;
     } else if (!strcmp(arg, "--transport")) {
         if (i + 1 >= argc) goto missing;
         const char *v = argv[++i];
@@ -593,7 +646,26 @@ int ds4_tp_adopt_distributed_options(
     }
     if (dist->layers.set) {
         tp_set_err(err, errlen,
-                   "tensor parallelism always uses one 50/50 worker; omit --layers");
+                   "tensor parallelism splits experts, not layers; omit --layers");
+        return 0;
+    }
+    if (tp->world == 3) {
+        if (dist->role == DS4_DISTRIBUTED_WORKER && tp->rank != 1 && tp->rank != 2) {
+            tp_set_err(err, errlen,
+                       "--role worker --tensor-parallel3 requires --tp-rank 1 or 2");
+            return 0;
+        }
+        if (dist->role == DS4_DISTRIBUTED_COORDINATOR && tp->rank != 0) {
+            tp_set_err(err, errlen,
+                       "the --tensor-parallel3 coordinator is rank 0; omit --tp-rank");
+            return 0;
+        }
+        if (tp->transport == DS4_TP_TRANSPORT_RDMA) {
+            tp_set_err(err, errlen, "--tensor-parallel3 uses the TCP mesh; omit --transport rdma");
+            return 0;
+        }
+    } else if (tp->rank != 0) {
+        tp_set_err(err, errlen, "--tp-rank requires --tensor-parallel3");
         return 0;
     }
     if (dist->prefill_chunk || dist->prefill_window || dist->activation_bits ||
@@ -648,7 +720,8 @@ int ds4_tp_validate_engine_options(
     if (!ds4_tp_enabled(&opt->tp)) {
         if (opt->tp.requested || opt->tp.transport != DS4_TP_TRANSPORT_AUTO ||
             opt->tp.rdma_device || opt->tp.rdma_port || opt->tp.rdma_gid_index_set ||
-            opt->tp.glm_token_prefill || opt->tp.debug_hash != 0) {
+            opt->tp.glm_token_prefill || opt->tp.debug_hash != 0 ||
+            opt->tp.world != 0 || opt->tp.rank != 0) {
             tp_set_err(err, errlen,
                        "tensor-parallel options require --tensor-parallel and --role");
             return 0;
@@ -685,6 +758,15 @@ int ds4_tp_validate_engine_options(
         (opt->ssd_streaming || opt->dspark || opt->glm_mtp ||
          (opt->mtp_path && opt->mtp_path[0]) || opt->cuda_tensor_parallel)) {
         tp_set_err(err, errlen, "V4.1 ROCm network TP requires resident weights without speculative drafting or local multi-GPU TP");
+        return 0;
+    }
+    if (opt->tp.world == 3 && opt->backend != DS4_BACKEND_CUDA) {
+        tp_set_err(err, errlen, "--tensor-parallel3 requires the ROCm backend");
+        return 0;
+    }
+#else
+    if (opt->tp.world == 3) {
+        tp_set_err(err, errlen, "--tensor-parallel3 requires a Linux ROCm build");
         return 0;
     }
 #endif
@@ -2122,6 +2204,10 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
     return 1;
 }
 
+#ifdef DS4_TP_LINUX
+static int tp3_create(ds4_tp *tp, const ds4_tp_identity *id, char *err, size_t errlen);
+#endif
+
 int ds4_tp_create(
         ds4_tp **out,
         const ds4_tp_options *opt,
@@ -2139,6 +2225,8 @@ int ds4_tp_create(
     tp->rank = opt->role == DS4_TP_LEADER ? 0 : 1;
     tp->control_fd = -1;
     tp->data_fd = -1;
+    tp->world = 2;
+    for (int r = 0; r < 3; r++) tp->ctl_fds[r] = tp->peer_fds[r] = -1;
     atomic_init(&tp->failed, false);
     tp->timeout_sec = DS4_TP_DEFAULT_TIMEOUT_SEC;
     const char *tmo = getenv("DS4_TP_TIMEOUT_SEC");
@@ -2150,6 +2238,20 @@ int ds4_tp_create(
         if (value > 0 && value <= 60000) tp->gate_timeout_ms = (uint64_t)value;
     }
 
+    if (opt->world == 3) {
+#ifdef DS4_TP_LINUX
+        if (!tp3_create(tp, id, err, errlen)) {
+            ds4_tp_free(tp);
+            return 0;
+        }
+        *out = tp;
+        return 1;
+#else
+        tp_set_err(err, errlen, "--tensor-parallel3 requires a Linux ROCm build");
+        ds4_tp_free(tp);
+        return 0;
+#endif
+    }
     int rdma_ok = 0;
 #ifdef DS4_TP_HAVE_VERBS
     if (opt->transport != DS4_TP_TRANSPORT_TCP &&
@@ -2258,6 +2360,14 @@ void ds4_tp_free(ds4_tp *tp) {
 #ifdef DS4_TP_LINUX
     tp_roce_close(tp);
 #endif
+    for (int r = 0; r < 3; r++) {
+        if (tp->ctl_fds[r] >= 0) {
+            if (tp->ctl_fds[r] == tp->control_fd) tp->control_fd = -1;
+            close(tp->ctl_fds[r]);
+        }
+        if (tp->peer_fds[r] >= 0) close(tp->peer_fds[r]);
+        free(tp->peer_rx[r]);
+    }
     if (tp->control_fd >= 0) close(tp->control_fd);
     if (tp->data_fd >= 0) close(tp->data_fd);
     free(tp);
@@ -2274,6 +2384,7 @@ void ds4_tp_detach_slab(ds4_tp *tp) {
 }
 
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
+int ds4_tp_world(const ds4_tp *tp) { return tp ? tp->world : 0; }
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
 const char *ds4_tp_transport_name(const ds4_tp *tp) {
     return tp->rdma_active ? "rdma" : "tcp";
@@ -2295,10 +2406,390 @@ typedef struct {
     uint32_t magic, kind, layer, gate;
     uint64_t epoch, seq, bytes;
 } ds4_tp_linux_gate_header;
+#endif
+#ifdef DS4_TP_LINUX
+/* ------------------------------------------------------------------------
+ * --tensor-parallel3 mesh (TCP only).
+ *
+ * Rank 0 listens on --listen. Each worker dials it twice (control, then
+ * data) and names itself with a join record. Rank 1 also listens on
+ * leader_port + 1 (DS4_TP3_PEER_PORT overrides) for the rank-2 data link;
+ * rank 2 learns rank 1's address from the leader (DS4_TP3_PEER_HOST
+ * overrides). Every gate sends this rank's partial to both peers and sums
+ * the three partials in rank order on the CPU.
+ * --------------------------------------------------------------------- */
+
+#define DS4_TP3_MAGIC UINT32_C(0x44533433) /* "DS43" */
+
+enum { TP3_JOIN_CONTROL = 0, TP3_JOIN_LEADER_DATA = 1, TP3_JOIN_PEER_DATA = 2 };
+
+typedef struct {
+    uint32_t magic, world, rank, kind;
+    uint64_t epoch;
+} ds4_tp3_join;
+
+typedef struct {
+    uint32_t magic, peer_port;
+    uint64_t epoch;
+    char peer_host[64];
+} ds4_tp3_info;
+
+typedef struct {
+    uint32_t magic, rank;
+    uint64_t epoch;
+} ds4_tp3_ready;
+
+static int tp3_read_timeout(int fd, void *buf, size_t len, double timeout_sec) {
+    const double deadline = tp_now_sec() + timeout_sec;
+    char *p = buf;
+    while (len) {
+        const double remaining = deadline - tp_now_sec();
+        if (remaining <= 0) { errno = ETIMEDOUT; return 0; }
+        struct pollfd pfd = {fd, POLLIN, 0};
+        int rc = poll(&pfd, 1, remaining > 1.0 ? 1000 : (int)(remaining * 1000.0) + 1);
+        if (rc < 0 && errno != EINTR) return 0;
+        if (rc <= 0) continue;
+        ssize_t r = recv(fd, p, len, 0);
+        if (r < 0) { if (errno == EINTR) continue; return 0; }
+        if (r == 0) { errno = ECONNRESET; return 0; }
+        p += r;
+        len -= (size_t)r;
+    }
+    return 1;
+}
+
+static int tp3_accept_timeout(int listener, double timeout_sec) {
+    const double deadline = tp_now_sec() + timeout_sec;
+    for (;;) {
+        const double remaining = deadline - tp_now_sec();
+        if (remaining <= 0) { errno = ETIMEDOUT; return -1; }
+        struct pollfd pfd = {listener, POLLIN, 0};
+        int rc = poll(&pfd, 1, remaining > 1.0 ? 1000 : (int)(remaining * 1000.0) + 1);
+        if (rc < 0 && errno != EINTR) return -1;
+        if (rc <= 0) continue;
+        int fd = accept(listener, NULL, NULL);
+        if (fd >= 0 || (errno != EINTR && errno != EAGAIN)) return fd;
+    }
+}
+
+static int tp3_peer_host(int fd, char *host, size_t hostlen) {
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    if (getpeername(fd, (struct sockaddr *)&ss, &len) != 0) return 0;
+    return getnameinfo((struct sockaddr *)&ss, len, host, (socklen_t)hostlen,
+                       NULL, 0, NI_NUMERICHOST) == 0;
+}
+
+static int tp3_data_socket_ready(ds4_tp *tp, int fd, char *err, size_t errlen) {
+    tp_socket_tune(fd);
+    if (!tp_socket_set_gate_timeout(fd, tp->gate_timeout_ms)) {
+        tp_set_err(err, errlen, "tp3 data socket timeout: %s", strerror(errno));
+        return 0;
+    }
+    return 1;
+}
+
+static int tp3_leader_create(ds4_tp *tp, const ds4_tp_identity *id,
+                             char *err, size_t errlen) {
+    int listener = tp_listen(tp->opt.listen_host, tp->opt.listen_port, err, errlen);
+    if (listener < 0) return 0;
+    fprintf(stderr, "ds4-tp3: waiting for ranks 1 and 2 on %s:%d ...\n",
+            tp->opt.listen_host ? tp->opt.listen_host : "0.0.0.0", tp->opt.listen_port);
+    uint64_t epoch = 0;
+    ssize_t got;
+    do { got = getrandom(&epoch, sizeof(epoch), 0); } while (got < 0 && errno == EINTR);
+    if (got != sizeof(epoch)) {
+        tp_set_err(err, errlen, "tp3 epoch: %s", strerror(errno));
+        goto fail;
+    }
+    uint32_t have = 0; /* bit per (rank, kind): ctl r -> r, data r -> 2 + r */
+    while (have != 0x3cu /* ctl1 ctl2 data1 data2 */) {
+        int fd = tp3_accept_timeout(listener, (double)tp->timeout_sec);
+        if (fd < 0) {
+            tp_set_err(err, errlen, "tp3 accept: %s", strerror(errno));
+            goto fail;
+        }
+        ds4_tp3_join join;
+        if (!tp3_read_timeout(fd, &join, sizeof(join), 30.0) ||
+            join.magic != DS4_TP3_MAGIC || join.world != 3 ||
+            (join.rank != 1 && join.rank != 2) ||
+            (join.kind != TP3_JOIN_CONTROL && join.kind != TP3_JOIN_LEADER_DATA)) {
+            fprintf(stderr, "ds4-tp3: rejected a connection with an invalid join record\n");
+            close(fd);
+            continue;
+        }
+        if (join.kind == TP3_JOIN_CONTROL) {
+            if (tp->ctl_fds[join.rank] >= 0) {
+                tp_set_err(err, errlen, "tp3: rank %u joined twice", join.rank);
+                close(fd);
+                goto fail;
+            }
+            tp_socket_tune(fd);
+            tp->ctl_fds[join.rank] = fd;
+            tp->control_fd = fd;
+            if (!tp_hello_exchange(tp, id, 0, err, errlen)) goto fail;
+            if (tp->rdma_active) {
+                tp_set_err(err, errlen, "tp3: RDMA is not supported by the mesh");
+                goto fail;
+            }
+            have |= join.rank == 1 ? 0x04u : 0x08u;
+            fprintf(stderr, "ds4-tp3: rank %u control connected\n", join.rank);
+        } else {
+            if (tp->peer_fds[join.rank] >= 0) {
+                tp_set_err(err, errlen, "tp3: rank %u data joined twice", join.rank);
+                close(fd);
+                goto fail;
+            }
+            tp->peer_fds[join.rank] = fd;
+            if (!tp3_data_socket_ready(tp, fd, err, errlen)) goto fail;
+            have |= join.rank == 1 ? 0x10u : 0x20u;
+            fprintf(stderr, "ds4-tp3: rank %u data connected\n", join.rank);
+        }
+    }
+    tp->control_fd = tp->ctl_fds[1];
+    tp->epoch = epoch;
+    ds4_tp3_info info = {DS4_TP3_MAGIC, 0, epoch, {0}};
+    if (!tp3_peer_host(tp->ctl_fds[1], info.peer_host, sizeof(info.peer_host))) {
+        tp_set_err(err, errlen, "tp3: cannot resolve rank 1 address");
+        goto fail;
+    }
+    for (int r = 1; r <= 2; r++) {
+        if (!tp_write_full(tp->ctl_fds[r], &info, sizeof(info))) {
+            tp_set_err(err, errlen, "tp3: info send to rank %d failed", r);
+            goto fail;
+        }
+    }
+    for (int r = 1; r <= 2; r++) {
+        ds4_tp3_ready ready;
+        if (!tp3_read_timeout(tp->ctl_fds[r], &ready, sizeof(ready), (double)tp->timeout_sec) ||
+            ready.magic != DS4_TP3_MAGIC || ready.rank != (uint32_t)r || ready.epoch != epoch) {
+            tp_set_err(err, errlen, "tp3: rank %d did not complete the mesh", r);
+            goto fail;
+        }
+    }
+    close(listener);
+    fprintf(stderr, "ds4-tp3: mesh ready (rank 1 at %s), transport=tcp gate-timeout=%llums\n",
+            info.peer_host, (unsigned long long)tp->gate_timeout_ms);
+    return 1;
+fail:
+    close(listener);
+    return 0;
+}
+
+static int tp3_join_send(int fd, uint32_t rank, uint32_t kind, uint64_t epoch) {
+    ds4_tp3_join join = {DS4_TP3_MAGIC, 3, rank, kind, epoch};
+    return tp_write_full(fd, &join, sizeof(join));
+}
+
+static int tp3_worker_create(ds4_tp *tp, const ds4_tp_identity *id,
+                             char *err, size_t errlen) {
+    const int rank = tp->rank;
+    int listener = -1;
+    int peer_port = tp->opt.leader_port + 1;
+    const char *port_env = getenv("DS4_TP3_PEER_PORT");
+    if (port_env && atoi(port_env) > 0) peer_port = atoi(port_env);
+    if (rank == 1) {
+        listener = tp_listen(NULL, peer_port, err, errlen);
+        if (listener < 0) return 0;
+    }
+    tp->control_fd = tp_dial(tp->opt.leader_host, tp->opt.leader_port,
+                             (double)tp->timeout_sec, err, errlen);
+    if (tp->control_fd < 0) goto fail;
+    tp_socket_tune(tp->control_fd);
+    if (!tp3_join_send(tp->control_fd, (uint32_t)rank, TP3_JOIN_CONTROL, 0) ||
+        !tp_hello_exchange(tp, id, 0, err, errlen)) {
+        if (err && !err[0]) tp_set_err(err, errlen, "tp3: control join failed");
+        goto fail;
+    }
+    if (tp->rdma_active) {
+        tp_set_err(err, errlen, "tp3: RDMA is not supported by the mesh");
+        goto fail;
+    }
+    int fd = tp_dial(tp->opt.leader_host, tp->opt.leader_port,
+                     (double)tp->timeout_sec, err, errlen);
+    if (fd < 0) goto fail;
+    tp->peer_fds[0] = fd;
+    if (!tp3_join_send(fd, (uint32_t)rank, TP3_JOIN_LEADER_DATA, 0)) {
+        tp_set_err(err, errlen, "tp3: data join failed");
+        goto fail;
+    }
+    if (!tp3_data_socket_ready(tp, fd, err, errlen)) goto fail;
+    ds4_tp3_info info;
+    if (!tp3_read_timeout(tp->control_fd, &info, sizeof(info), (double)tp->timeout_sec) ||
+        info.magic != DS4_TP3_MAGIC) {
+        tp_set_err(err, errlen, "tp3: missing mesh info from the leader");
+        goto fail;
+    }
+    info.peer_host[sizeof(info.peer_host) - 1] = 0;
+    tp->epoch = info.epoch;
+    if (rank == 1) {
+        for (;;) {
+            fd = tp3_accept_timeout(listener, (double)tp->timeout_sec);
+            if (fd < 0) {
+                tp_set_err(err, errlen, "tp3: rank 2 did not connect to port %d: %s",
+                           peer_port, strerror(errno));
+                goto fail;
+            }
+            ds4_tp3_join join;
+            if (tp3_read_timeout(fd, &join, sizeof(join), 30.0) &&
+                join.magic == DS4_TP3_MAGIC && join.world == 3 && join.rank == 2 &&
+                join.kind == TP3_JOIN_PEER_DATA && join.epoch == tp->epoch) break;
+            fprintf(stderr, "ds4-tp3: rejected an invalid peer connection\n");
+            close(fd);
+        }
+        tp->peer_fds[2] = fd;
+        close(listener);
+        listener = -1;
+    } else {
+        const char *host_env = getenv("DS4_TP3_PEER_HOST");
+        const char *host = host_env && host_env[0] ? host_env : info.peer_host;
+        fprintf(stderr, "ds4-tp3: connecting to rank 1 at %s:%d\n", host, peer_port);
+        fd = tp_dial(host, peer_port, (double)tp->timeout_sec, err, errlen);
+        if (fd < 0) goto fail;
+        tp->peer_fds[1] = fd;
+        if (!tp3_join_send(fd, 2, TP3_JOIN_PEER_DATA, tp->epoch)) {
+            tp_set_err(err, errlen, "tp3: peer join failed");
+            goto fail;
+        }
+    }
+    if (!tp3_data_socket_ready(tp, tp->peer_fds[rank == 1 ? 2 : 1], err, errlen)) goto fail;
+    ds4_tp3_ready ready = {DS4_TP3_MAGIC, (uint32_t)rank, tp->epoch};
+    if (!tp_write_full(tp->control_fd, &ready, sizeof(ready))) {
+        tp_set_err(err, errlen, "tp3: ready send failed");
+        goto fail;
+    }
+    fprintf(stderr, "ds4-tp3: rank %d joined the mesh, transport=tcp gate-timeout=%llums\n",
+            rank, (unsigned long long)tp->gate_timeout_ms);
+    return 1;
+fail:
+    if (listener >= 0) close(listener);
+    return 0;
+}
+
+static int tp3_create(ds4_tp *tp, const ds4_tp_identity *id, char *err, size_t errlen) {
+    tp->world = 3;
+    tp->rank = tp->opt.role == DS4_TP_LEADER ? 0 : tp->opt.rank;
+    if (tp->rank < 0 || tp->rank > 2 || (tp->opt.role != DS4_TP_LEADER && tp->rank == 0)) {
+        tp_set_err(err, errlen, "tp3: invalid rank %d", tp->rank);
+        return 0;
+    }
+    if (tp->opt.transport == DS4_TP_TRANSPORT_RDMA) {
+        tp_set_err(err, errlen, "tp3: the mesh is TCP only");
+        return 0;
+    }
+    tp->opt.transport = DS4_TP_TRANSPORT_TCP;
+    return tp->rank == 0 ? tp3_leader_create(tp, id, err, errlen) :
+                           tp3_worker_create(tp, id, err, errlen);
+}
+
+/* Send hdr+payload to both peers and receive both peers' hdr+payload. */
+static int tp3_exchange(ds4_tp *tp, const void *hdr, void *peer_hdr_buf,
+                        size_t hdr_bytes, const void *out, uint64_t bytes,
+                        uint64_t timeout_ms) {
+    int peers[2], n = 0;
+    for (int r = 0; r < 3; r++) if (r != tp->rank) peers[n++] = r;
+    uint64_t sent[2] = {0, 0}, recvd[2] = {0, 0};
+    const uint64_t total = hdr_bytes + bytes;
+    const double deadline_step = (double)timeout_ms / 1000.0;
+    double deadline = tp_now_sec() + deadline_step;
+    for (;;) {
+        bool done = true, progress = false;
+        for (int i = 0; i < 2; i++) {
+            const int fd = tp->peer_fds[peers[i]];
+            char *rx_hdr = (char *)peer_hdr_buf + (size_t)i * hdr_bytes;
+            if (sent[i] < total) {
+                done = false;
+                const bool in_hdr = sent[i] < hdr_bytes;
+                const char *src = in_hdr ? (const char *)hdr + sent[i] :
+                    (const char *)out + (sent[i] - hdr_bytes);
+                uint64_t want = in_hdr ? hdr_bytes - sent[i] : total - sent[i];
+                if (want > 2097152u) want = 2097152u;
+                ssize_t w = send(fd, src, (size_t)want, MSG_DONTWAIT | MSG_NOSIGNAL);
+                if (w > 0) { sent[i] += (uint64_t)w; progress = true; }
+                else if (w == 0) { errno = EPIPE; return 0; }
+                else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return 0;
+            }
+            if (recvd[i] < total) {
+                done = false;
+                const bool in_hdr = recvd[i] < hdr_bytes;
+                char *dst = in_hdr ? rx_hdr + recvd[i] :
+                    (char *)tp->peer_rx[peers[i]] + (recvd[i] - hdr_bytes);
+                uint64_t want = in_hdr ? hdr_bytes - recvd[i] : total - recvd[i];
+                if (want > 2097152u) want = 2097152u;
+                ssize_t r = recv(fd, dst, (size_t)want, MSG_DONTWAIT);
+                if (r > 0) { recvd[i] += (uint64_t)r; progress = true; }
+                else if (r == 0) { errno = ECONNRESET; return 0; }
+                else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return 0;
+            }
+        }
+        if (done) return 1;
+        if (atomic_load_explicit(&tp->failed, memory_order_acquire)) { errno = ECANCELED; return 0; }
+        if (progress) { deadline = tp_now_sec() + deadline_step; continue; }
+        const double remaining = deadline - tp_now_sec();
+        if (remaining <= 0) { errno = ETIMEDOUT; return 0; }
+        struct pollfd pfd[2];
+        for (int i = 0; i < 2; i++) {
+            pfd[i].fd = tp->peer_fds[peers[i]];
+            pfd[i].events = (short)((sent[i] < total ? POLLOUT : 0) | (recvd[i] < total ? POLLIN : 0));
+            pfd[i].revents = 0;
+        }
+        int rc = poll(pfd, 2, remaining > .05 ? 50 : (int)(remaining * 1000.0) + 1);
+        if (rc < 0 && errno != EINTR) return 0;
+        for (int i = 0; rc > 0 && i < 2; i++) {
+            if (pfd[i].revents & POLLNVAL) { errno = EBADF; return 0; }
+            if (pfd[i].revents & POLLERR) { errno = EIO; return 0; }
+        }
+    }
+}
+
+static int tp3_gate(ds4_tp *tp, uint32_t kind, uint32_t layer, uint32_t gate,
+                    uint64_t seq, const void *out, void *in, uint64_t bytes,
+                    uint64_t grace_ms) {
+    if (ds4_tp_failed(tp)) return 0;
+    if (!out || !in || !bytes || (bytes & 3u) || layer >= tp->n_layer) {
+        errno = EINVAL;
+        goto fail;
+    }
+    if (tp->peer_rx_bytes < bytes) {
+        for (int r = 0; r < 3; r++) {
+            if (r == tp->rank) continue;
+            uint8_t *p = realloc(tp->peer_rx[r], (size_t)bytes);
+            if (!p) { errno = ENOMEM; goto fail; }
+            tp->peer_rx[r] = p;
+        }
+        tp->peer_rx_bytes = bytes;
+    }
+    ds4_tp_linux_gate_header h = {DS4_TP3_MAGIC, kind, layer, gate,
+                                  tp->epoch, seq, bytes}, peer[2];
+    if (!tp3_exchange(tp, &h, peer, sizeof(h), out, bytes,
+                      tp->gate_timeout_ms + grace_ms)) goto fail;
+    if (memcmp(&h, &peer[0], sizeof(h)) || memcmp(&h, &peer[1], sizeof(h))) {
+        errno = EPROTO;
+        goto fail;
+    }
+    const float *src[3];
+    for (int r = 0; r < 3; r++)
+        src[r] = r == tp->rank ? (const float *)out : (const float *)tp->peer_rx[r];
+    float *dst = in;
+    const uint64_t n = bytes / sizeof(float);
+    /* Same operand order on every rank: bit-identical replicated state. */
+    for (uint64_t i = 0; i < n; i++) dst[i] = (src[0][i] + src[1][i]) + src[2][i];
+    return 1;
+fail:
+    fprintf(stderr, "ds4-tp3: gate failed (rank=%d layer=%u kind=%u seq=%llu bytes=%llu): %s\n",
+            tp->rank, layer, kind, (unsigned long long)seq, (unsigned long long)bytes,
+            strerror(errno));
+    ds4_tp_mark_failed(tp);
+    return 0;
+}
+#endif
+
+#ifdef DS4_TP_LINUX
 
 static int tp_linux_gate(ds4_tp *tp, uint32_t kind, uint32_t layer,
                          uint32_t gate, uint64_t seq, const void *out,
                          void *in, uint64_t bytes, uint64_t grace_ms) {
+    if (tp->world == 3) return tp3_gate(tp, kind, layer, gate, seq, out, in, bytes, grace_ms);
     if (ds4_tp_failed(tp)) return 0;
     if (!out || !in || !bytes || bytes > SIZE_MAX || layer >= tp->n_layer) {
         errno = EINVAL;
@@ -2616,19 +3107,19 @@ static int tp_send_token_command(ds4_tp *tp, uint32_t type,
     memcpy(payload, &h, sizeof(h));
     int32_t *wire_tokens = (int32_t *)(payload + sizeof(h));
     for (uint32_t i = 0; i < count; i++) wire_tokens[i] = (int32_t)tokens[i];
-    const int ok = tp_send_frame(tp->control_fd, type, payload, bytes);
+    const int ok = tp_ctl_send(tp, type, payload, bytes);
     free(payload);
     return ok;
 }
 
 int ds4_tp_send_session_create(ds4_tp *tp, uint64_t session_id, int ctx_size) {
     ds4_tp_value_command msg = { session_id, (int32_t)ctx_size, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_CREATE,
+    return tp_ctl_send(tp, DS4_TP_FRAME_SESSION_CREATE,
                          &msg, sizeof(msg));
 }
 
 int ds4_tp_send_session_destroy(ds4_tp *tp, uint64_t session_id) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_DESTROY,
+    return tp_ctl_send(tp, DS4_TP_FRAME_SESSION_DESTROY,
                          &session_id, sizeof(session_id));
 }
 
@@ -2689,7 +3180,7 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
         memcpy(p, embedding->data, (size_t)data_bytes);
         p += data_bytes;
     }
-    int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_SYNC_MULTIMODAL,
+    int ok = tp_ctl_send(tp, DS4_TP_FRAME_SYNC_MULTIMODAL,
                            payload, (uint32_t)bytes64);
     free(payload);
     return ok;
@@ -2698,24 +3189,24 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token) {
     ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
+    return tp_ctl_send(tp, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
 }
 
 int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
                        uint64_t seq, int token, int limit) {
     if (limit < 1 || limit > 2) return 0;
     ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, (uint32_t)limit };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_GLM_MTP, &msg, sizeof(msg));
+    return tp_ctl_send(tp, DS4_TP_FRAME_GLM_MTP, &msg, sizeof(msg));
 }
 
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos) {
     ds4_tp_value_command msg = { session_id, (int32_t)pos, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_REWIND,
+    return tp_ctl_send(tp, DS4_TP_FRAME_REWIND,
                          &msg, sizeof(msg));
 }
 
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_INVALIDATE,
+    return tp_ctl_send(tp, DS4_TP_FRAME_INVALIDATE,
                          &session_id, sizeof(session_id));
 }
 
@@ -2727,13 +3218,13 @@ int ds4_tp_send_restore_payload(ds4_tp *tp, uint64_t session_id,
     if (!tp || tp->rank != 0 || !session_id || !fp || !bytes || ds4_tp_failed(tp))
         return 0;
     const double deadline = tp_now_sec() + (double)tp->timeout_sec;
-    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RESTORE_PAYLOAD,
+    if (!tp_ctl_send(tp, DS4_TP_FRAME_RESTORE_PAYLOAD,
                        header, sizeof(header))) goto failed;
     unsigned char buffer[65536];
     while (bytes) {
         const size_t count = bytes < sizeof(buffer) ? (size_t)bytes : sizeof(buffer);
         if (tp_now_sec() >= deadline || fread(buffer, 1, count, fp) != count ||
-            !tp_write_full(tp->control_fd, buffer, count)) goto failed;
+            !tp_ctl_write(tp, buffer, count)) goto failed;
         bytes -= count;
     }
     return ds4_tp_wait_command_ack(tp, session_id, "checkpoint restore", err, errlen);
@@ -2802,7 +3293,7 @@ int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
     ds4_tp_batch_command_header h = { count, 0 };
     memcpy(payload, &h, sizeof(h));
     memcpy(payload + sizeof(h), items, (size_t)count * sizeof(*items));
-    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL_BATCH,
+    const int ok = tp_ctl_send(tp, DS4_TP_FRAME_EVAL_BATCH,
                                  payload, bytes);
     free(payload);
     return ok;
@@ -2830,7 +3321,7 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
         wire_tokens[i] = (int32_t)prompt[i];
     }
     memcpy(payload + sizeof(h) + prompt_bytes, items, (size_t)item_bytes);
-    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_MIXED_BATCH,
+    const int ok = tp_ctl_send(tp, DS4_TP_FRAME_MIXED_BATCH,
                                  payload, bytes);
     free(payload);
     return ok;
@@ -2838,31 +3329,38 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
 
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status) {
     ds4_tp_command_ack ack = { session_id, (int32_t)status, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_COMMAND_ACK,
+    return tp_ctl_send(tp, DS4_TP_FRAME_COMMAND_ACK,
                          &ack, sizeof(ack));
 }
 
 int ds4_tp_wait_command_status(ds4_tp *tp, uint64_t session_id, int *status,
                                const char *operation, char *err, size_t errlen) {
-    uint32_t type = 0, bytes = 0;
-    ds4_tp_command_ack ack;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack) ||
-        !tp_read_full(tp->control_fd, &ack, sizeof(ack))) {
-        ds4_tp_mark_failed(tp);
-        tp_set_err(err, errlen, "tp: worker failed during %s",
-                   operation ? operation : "command");
-        return 0;
+    int fds[2];
+    const int n = tp_ctl_reply_fds(tp, fds);
+    int combined = 0;
+    /* Read every worker's ack so the control streams stay framed. */
+    for (int i = 0; i < n; i++) {
+        uint32_t type = 0, bytes = 0;
+        ds4_tp_command_ack ack;
+        if (!tp_read_frame_header(fds[i], &type, &bytes) ||
+            type != DS4_TP_FRAME_COMMAND_ACK || bytes != sizeof(ack) ||
+            !tp_read_full(fds[i], &ack, sizeof(ack))) {
+            ds4_tp_mark_failed(tp);
+            tp_set_err(err, errlen, "tp: worker %d failed during %s", i + 1,
+                       operation ? operation : "command");
+            return 0;
+        }
+        if (ack.session_id != session_id || ack.reserved != 0) {
+            ds4_tp_mark_failed(tp);
+            tp_set_err(err, errlen,
+                       "tp: worker %d %s failed (session %llu, status %d)", i + 1,
+                       operation ? operation : "command",
+                       (unsigned long long)ack.session_id, (int)ack.status);
+            return 0;
+        }
+        if (combined == 0) combined = ack.status;
     }
-    if (ack.session_id != session_id || ack.reserved != 0) {
-        ds4_tp_mark_failed(tp);
-        tp_set_err(err, errlen,
-                   "tp: worker %s failed (session %llu, status %d)",
-                   operation ? operation : "command",
-                   (unsigned long long)ack.session_id, (int)ack.status);
-        return 0;
-    }
-    *status = ack.status;
+    *status = combined;
     return 1;
 }
 
@@ -2889,8 +3387,31 @@ int ds4_tp_sync_checkpoint(ds4_tp *tp, uint32_t point, int current, int total,
         uint32_t cancelled;
     } local = {++tp->sync_checkpoint_seq, point, current, total, requested}, peer;
     uint32_t type, bytes;
+    if (tp->world == 3 && tp->rank == 0) {
+        /* Gather both workers first, then publish the agreed decision. */
+        bool any = requested;
+        for (int r = 1; r <= 2; r++) {
+            if (ds4_tp_failed(tp) ||
+                !tp_read_frame_header(tp->ctl_fds[r], &type, &bytes) ||
+                type != DS4_TP_FRAME_SYNC_CHECKPOINT || bytes != sizeof(peer) ||
+                !tp_read_full(tp->ctl_fds[r], &peer, sizeof(peer)) ||
+                peer.seq != local.seq || peer.point != point ||
+                peer.current != current || peer.total != total || peer.cancelled > 1u) {
+                ds4_tp_mark_failed(tp);
+                return 0;
+            }
+            any = any || peer.cancelled;
+        }
+        local.cancelled = any;
+        if (!tp_ctl_send(tp, DS4_TP_FRAME_SYNC_CHECKPOINT, &local, sizeof(local))) {
+            ds4_tp_mark_failed(tp);
+            return 0;
+        }
+        *cancelled = any;
+        return 1;
+    }
     if (ds4_tp_failed(tp) ||
-        !tp_send_frame(tp->control_fd, DS4_TP_FRAME_SYNC_CHECKPOINT, &local, sizeof(local)) ||
+        !tp_ctl_send(tp, DS4_TP_FRAME_SYNC_CHECKPOINT, &local, sizeof(local)) ||
         !tp_read_frame_header(tp->control_fd, &type, &bytes) ||
         type != DS4_TP_FRAME_SYNC_CHECKPOINT || bytes != sizeof(peer) ||
         !tp_read_full(tp->control_fd, &peer, sizeof(peer)) ||
@@ -2904,7 +3425,7 @@ int ds4_tp_sync_checkpoint(ds4_tp *tp, uint32_t point, int current, int total,
 }
 
 int ds4_tp_send_stop(ds4_tp *tp) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_STOP, NULL, 0);
+    return tp_ctl_send(tp, DS4_TP_FRAME_STOP, NULL, 0);
 }
 
 void ds4_tp_command_free(ds4_tp_command *command) {
@@ -3157,6 +3678,10 @@ int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count) {
 
 int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count) {
     uint32_t type = 0, bytes = 0;
+    if (tp->world == 3) {
+        fprintf(stderr, "ds4-tp3: the three-rank mesh keeps the full vocabulary head on rank 0\n");
+        return 0;
+    }
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
         type != DS4_TP_FRAME_LOGITS || bytes != count * sizeof(float)) {
         fprintf(stderr, "ds4-tp: bad logits frame (type %u bytes %u)\n", type, bytes);
@@ -3173,7 +3698,7 @@ int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
 
 int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t mode, int32_t token_count) {
     struct { int32_t mode; int32_t count; } msg = { mode, token_count };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_VERIFY_COMMIT,
+    return tp_ctl_send(tp, DS4_TP_FRAME_VERIFY_COMMIT,
                          &msg, sizeof(msg));
 }
 
@@ -3194,25 +3719,30 @@ int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *mode, int32_t *token_count) {
 
 int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t errlen) {
     struct { uint64_t seq; uint64_t hash; } mine = { seq, hash }, theirs;
-    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_HASH, &mine, sizeof(mine))) {
+    if (!tp_ctl_send(tp, DS4_TP_FRAME_HASH, &mine, sizeof(mine))) {
         tp_set_err(err, errlen, "tp: hash send failed");
         return 0;
     }
-    uint32_t type = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_HASH || bytes != sizeof(theirs) ||
-        !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
-        tp_set_err(err, errlen, "tp: hash recv failed");
-        return 0;
+    int fds[2];
+    const int n = tp_ctl_reply_fds(tp, fds);
+    int rc = 1;
+    for (int i = 0; i < n; i++) {
+        uint32_t type = 0, bytes = 0;
+        if (!tp_read_frame_header(fds[i], &type, &bytes) ||
+            type != DS4_TP_FRAME_HASH || bytes != sizeof(theirs) ||
+            !tp_read_full(fds[i], &theirs, sizeof(theirs))) {
+            tp_set_err(err, errlen, "tp: hash recv failed");
+            return 0;
+        }
+        if (rc == 1 && (theirs.seq != seq || theirs.hash != hash)) {
+            tp_set_err(err, errlen,
+                       "tp: LOCKSTEP DIVERGENCE at seq %llu: local %016llx peer %016llx",
+                       (unsigned long long)seq,
+                       (unsigned long long)hash, (unsigned long long)theirs.hash);
+            rc = -1;
+        }
     }
-    if (theirs.seq != seq || theirs.hash != hash) {
-        tp_set_err(err, errlen,
-                   "tp: LOCKSTEP DIVERGENCE at seq %llu: local %016llx peer %016llx",
-                   (unsigned long long)seq,
-                   (unsigned long long)hash, (unsigned long long)theirs.hash);
-        return -1;
-    }
-    return 1;
+    return rc;
 }
 
 /* ------------------------------------------------------------------------

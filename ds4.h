@@ -127,6 +127,10 @@ typedef struct {
     bool rdma_gid_index_set;
     bool glm_token_prefill;
     int debug_hash;             /* cross-check hidden state every N tokens */
+    /* --tensor-parallel3: three ranks in a full TCP mesh (V4.1 ROCm only).
+     * world 0 means the classic two-rank pair; workers name their rank. */
+    int world;
+    int rank;
 } ds4_tp_options;
 
 typedef struct {

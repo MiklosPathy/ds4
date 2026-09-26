@@ -102,6 +102,10 @@ int ds4_tp_create(
 void ds4_tp_free(ds4_tp *tp);
 
 int ds4_tp_rank(const ds4_tp *tp);
+/* 2 for the classic pair, 3 for --tensor-parallel3. Under three ranks every
+ * gate delivers the complete rank-ordered sum ((r0 + r1) + r2) in its "in"
+ * vector, so all ranks see bit-identical reductions. */
+int ds4_tp_world(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
 const char *ds4_tp_transport_name(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
