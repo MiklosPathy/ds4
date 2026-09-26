@@ -165,11 +165,75 @@ requirements. DeepSeek Vision Experimental uses a different checkpoint from
 Flash 0731; GLM 5.3 Flash and Qwen3.8 Flash Next add vision to the same text
 model through a separate encoder.
 
-DeepSeek V4.1 Flash text and vision run on Metal and ROCm on Strix Halo (`gfx1151`); CUDA supports text on DGX Spark. ROCm Q2 supports resident weights, SSD streaming and two-machine resident clustering. See [ROCm qualification](QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151) and [clustering setup](docs/CLUSTERING_ROCM.md).
+DeepSeek V4.1 Flash text and vision run on Metal and ROCm on Strix Halo (`gfx1151`); CUDA supports text on DGX Spark. ROCm Q2 supports resident weights, SSD streaming and two-machine resident clustering; Q4 and Q2 run resident across three machines with [`--tensor-parallel3`](#three-strix-halo-machines---tensor-parallel3). See [ROCm qualification](QA_BEFORE_RELEASES.md#deepseek-v41-flash-rocmgfx1151) and [clustering setup](docs/CLUSTERING_ROCM.md).
 
 Q2 runs with SSD streaming on one 128 GB Mac or Spark, or resident across two Macs or two Sparks using RDMA. Q4 needs SSD streaming or a 512 GB Mac. Engram tables remain on disk in every mode, so use a fast
 local SSD. See the [model guide](docs/MODELS.md#deepseek-v41-flash) for downloads
 and setup.
+
+### Three Strix Halo machines: `--tensor-parallel3`
+
+`--tensor-parallel3` runs DeepSeek V4.1 Flash **Q4** (or Q2) resident across
+three 128 GB Strix Halo (`gfx1151`) machines. Each machine holds one third of
+the routed experts (about 104 GiB of Q4 weights), 3/3/2 of the attention
+output groups, and the full dense weights. The machines talk over a full TCP
+mesh: every machine needs a direct, reachable address for the other two, for
+example three USB4/Thunderbolt cables in a triangle.
+
+Requirements:
+
+- ROCm build on every machine (`make strix-halo ROCM_ARCH=gfx1151`), the same
+  engine revision everywhere.
+- The same GGUF on every machine (`DeepSeek-V4.1-Flash-Q4.gguf`), and the same
+  `--vision` encoder on every machine if you use images.
+- About 124 GiB GPU-visible memory per machine (see
+  [GPU-visible memory](docs/STRIX_HALO.md#gpu-visible-memory)).
+- TCP ports open: the coordinator's port (9911 below) and that port + 1 (9912)
+  on the rank 1 machine, where rank 2 connects.
+
+**Every worker must be started with its own `--tp-rank`, and the ranks must
+differ: exactly one machine runs `--tp-rank 1` and exactly one runs
+`--tp-rank 2`. The coordinator is always rank 0 and takes no `--tp-rank`.**
+The rank decides which third of the experts a machine loads, so two workers
+with the same rank, or a missing rank, cannot form a working cluster. Keep
+the same `--ctx` on all three machines.
+
+The example uses `10.99.0.1` for the coordinator. Start the two workers, then
+the coordinator; they wait for each other, so the order is not critical.
+
+```sh
+# Machine 2: rank 1
+./ds4 --rocm -m ~/models/DeepSeek-V4.1-Flash-Q4.gguf \
+  --vision ~/models/DeepSeek-V4.1-Flash-Vision.gguf --ctx 262144 \
+  --tensor-parallel3 --role worker --tp-rank 1 --coordinator 10.99.0.1 9911
+
+# Machine 3: rank 2
+./ds4 --rocm -m ~/models/DeepSeek-V4.1-Flash-Q4.gguf \
+  --vision ~/models/DeepSeek-V4.1-Flash-Vision.gguf --ctx 262144 \
+  --tensor-parallel3 --role worker --tp-rank 2 --coordinator 10.99.0.1 9911
+
+# Machine 1: coordinator (rank 0), serves the HTTP API and web UI
+./ds4-server --rocm -m ~/models/DeepSeek-V4.1-Flash-Q4.gguf \
+  --vision ~/models/DeepSeek-V4.1-Flash-Vision.gguf --ctx 262144 \
+  --tensor-parallel3 --role coordinator --listen 10.99.0.1 9911 \
+  --batched-session 1 --host 0.0.0.0 --port 8080
+```
+
+Rank 2 learns rank 1's address from the coordinator. If that address is not
+reachable from rank 2, set `DS4_TP3_PEER_HOST` on rank 2; `DS4_TP3_PEER_PORT`
+changes port 9912 on both workers. The HTTP API runs only on the coordinator;
+drop `--vision` on all three machines for text-only use.
+
+Q4 with vision fits a 256K context (`--ctx 262144`). The 1M maximum does not
+fit next to the Q4 weights. For experiments near the limit,
+`DS4_V41_ROCM_PREFILL_ROWS=1024` (or 512) and `DS4_V41_CARRY_MIB=0` shrink the
+prefill buffers at some prefill speed; set them the same on all machines.
+
+Measured on three GMKtec Strix Halo machines over USB4 (about 9 Gbit/s):
+about 12.7 tokens/s decode and 115 tokens/s prefill with Q4. Gates wait up to
+`DS4_TP_TIMEOUT_SEC` (default 300 s) for a slow peer, such as a disk-bound
+Engram read; the logs report waits over 250 ms as
+`ds4-tp3: rank N waited ...`. `DS4_TP3_PROFILE=1` prints gate timing.
 
 With the matching encoder passed as `--vision FILE`, use `/read image.png`
 in the CLI or `view_image` in the native agent.
