@@ -40252,8 +40252,16 @@ static uint32_t ds41_prefill_limit(uint32_t ctx) {
 static uint32_t ds41_prefill_limit(uint32_t ctx) {
     const uint32_t limit = ds41_prefill_logical_limit(ctx);
     /* Bound ROCm workspace memory independently of the causal sweep.
-     * Full-context admission still includes model, carry and runtime storage. */
-    return limit < 2048u ? limit : 2048u;
+     * Full-context admission still includes model, carry and runtime storage.
+     * DS4_V41_ROCM_PREFILL_ROWS (256..2048, multiple of 256) trades prefill
+     * tile width for memory; each row also holds a ctx/8 block mask. */
+    uint32_t rows = 2048u;
+    const char *env = getenv("DS4_V41_ROCM_PREFILL_ROWS");
+    if (env) {
+        const long v = strtol(env, NULL, 10);
+        if (v >= 256 && v <= 2048 && v % 256 == 0) rows = (uint32_t)v;
+    }
+    return limit < rows ? limit : rows;
 }
 #endif
 
@@ -40267,7 +40275,12 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     const uint64_t row_bytes = ((uint64_t)ds41_carry_words(DS4_N_HC * DS4_N_EMBD,
         DS4_V41_CARRY_BF16, compact) + DS4_N_HC + 24u + DS4_N_INDEXER_TOP_K +
         ds41_carry_words((ctx + 7u) / 8u, DS4_V41_CARRY_MASK, compact)) * sizeof(float);
-    uint64_t cap = (UINT64_C(3) << 30) / row_bytes;
+    /* DS4_V41_CARRY_MIB bounds the wide-prefill carry (default 3072 MiB);
+     * 0 disables layer-major sweeps wider than one prefill tile. */
+    uint64_t budget = UINT64_C(3) << 30;
+    const char *env = getenv("DS4_V41_CARRY_MIB");
+    if (env) budget = (uint64_t)strtoull(env, NULL, 10) << 20;
+    uint64_t cap = budget / row_bytes;
     if (cap > 32768u) cap = 32768u;
     if (cap > ctx) cap = ctx;
 #ifdef DS4_ROCM_BUILD
