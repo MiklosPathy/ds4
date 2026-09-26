@@ -17,7 +17,7 @@ struct rocm_tp_job {
 };
 struct rocm_tp_state {
     bool active = false, started = false, spin_scalar = false;
-    uint64_t seq = 0, posted = 0, pending = 0, timeout_ticks = 0;
+    uint64_t seq = 0, posted = 0, pending = 0, timeout_ticks = 0, bulk_timeout_ticks = 0;
     uint32_t pending_count = 0;
     bool pending_deferred = false;
     void *pending_big_in = nullptr;
@@ -187,6 +187,8 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
     g_rocm_tp.device = (rocm_tp_shared *)g_rocm_tp.flags->ptr;
     memset(g_rocm_tp.host, 0, sizeof(rocm_tp_shared));
     g_rocm_tp.timeout_ticks = (uint64_t)khz * 1000u * 5u;
+    /* Bulk prefill gates may wait for a peer's disk-bound Engram reads. */
+    g_rocm_tp.bulk_timeout_ticks = (uint64_t)khz * 1000u * 300u;
     g_rocm_tp.spin_scalar = ds4_rocm_is_gfx1151();
     g_rocm_tp.active = true;
     g_rocm_tp.slab = slab;
@@ -218,7 +220,8 @@ static int rocm_tp_enqueue(rocm_tp_job job, uint32_t count, bool defer_wait = fa
     g_rocm_tp.jobs[slot] = job;
     rocm_tp_arrive<<<1, 1>>>(g_rocm_tp.device, slot, seq);
     if (!defer_wait && !(job.kind == 0 && rocm_tp_fused_scalar_gate()))
-        rocm_tp_wait<<<1, 1>>>(g_rocm_tp.device, slot, seq, g_rocm_tp.timeout_ticks);
+        rocm_tp_wait<<<1, 1>>>(g_rocm_tp.device, slot, seq,
+            job.kind == 2 ? g_rocm_tp.bulk_timeout_ticks : g_rocm_tp.timeout_ticks);
     if (!cuda_ok(cudaGetLastError(), "TP gate enqueue")) return rocm_tp_fail();
     g_rocm_tp.seq = g_rocm_tp.pending = seq;
     g_rocm_tp.pending_count = count;
@@ -286,7 +289,7 @@ extern "C" int ds4_gpu_tp_big_gate_join(uint32_t layer, uint32_t rows,
     const rocm_tp_job &job = g_rocm_tp.jobs[slot];
     if (job.seq != seq || job.kind != 2 || job.layer != layer || job.arg != rows ||
         job.bytes != bytes) return rocm_tp_fail();
-    rocm_tp_wait<<<1, 1>>>(g_rocm_tp.device, slot, seq, g_rocm_tp.timeout_ticks);
+    rocm_tp_wait<<<1, 1>>>(g_rocm_tp.device, slot, seq, g_rocm_tp.bulk_timeout_ticks);
     rocm_tp_copy<<<256, 256>>>(g_rocm_tp.device, (float *)in_t->ptr,
                             (const float *)g_rocm_tp.big_in->ptr, bytes / 4);
     if (!cuda_ok(cudaGetLastError(), "TP deferred receive")) return rocm_tp_fail();
