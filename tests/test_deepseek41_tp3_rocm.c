@@ -127,7 +127,7 @@ static void fill_q4k(unsigned char *p, size_t blocks) {
 }
 
 static int moe(unsigned n) {
-    enum { E = 12, USED = 6, IN = 5120, MID = 2304, OUT = 5120 };
+    enum { E = 24, USED = 6, IN = 5120, MID = 2304, OUT = 5120 };
     const uint64_t gate_row = IN / 256 * 144, down_row = MID / 256 * 144;
     const uint64_t gate_expert = gate_row * MID, down_expert = down_row * OUT;
     const size_t wb = (size_t)E * (2 * gate_expert + down_expert);
@@ -166,6 +166,23 @@ static int moe(unsigned n) {
         IN, MID, OUT, st, wt, E, USED, 10.0f, xt, 0, n, &f16, true));
     CHECK(ds4_gpu_synchronize());
     CHECK(ds4_gpu_tensor_read(out, 0, full, (size_t)n * OUT * 4));
+    if (n >= 32) {
+        /* Prefill uses MMQ (Q8_1 activations). One rank owning every expert
+         * gives the same arithmetic as the three-rank partition. */
+        float *all = malloc((size_t)n * OUT * 4);
+        CHECK(all);
+        CHECK(ds4_gpu_tensor_write(st, 0, sel, pairs * 4) && ds4_gpu_tensor_write(wt, 0, w, pairs * 4));
+        CHECK(ds4_gpu_routed_moe_batch_owned_tensor(out, gate, up, mid, down, model, wb,
+            gate_off, up_off, down_off, 12, 12, gate_expert, gate_row, down_expert, down_row,
+            IN, MID, OUT, st, wt, E, USED, 0, E, 10.0f, xt, 0, n, &f16));
+        CHECK(ds4_gpu_synchronize());
+        CHECK(ds4_gpu_tensor_read(out, 0, all, (size_t)n * OUT * 4));
+        fprintf(stderr, "q4k moe rows=%u MMQ versus Q8_K reference rel_err=%.3g\n", n,
+                rel_error(all, full, (size_t)n * OUT));
+        CHECK(rel_error(all, full, (size_t)n * OUT) < 2e-2);
+        memcpy(full, all, (size_t)n * OUT * 4);
+        free(all);
+    }
     for (unsigned r = 0; r < 3; r++) {
         /* The owned path rewrites ids and weights in place. */
         CHECK(ds4_gpu_tensor_write(st, 0, sel, pairs * 4) && ds4_gpu_tensor_write(wt, 0, w, pairs * 4));
