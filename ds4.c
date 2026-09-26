@@ -73671,6 +73671,10 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         goto fail;
     }
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
+#ifdef DS4_ROCM_BUILD
+    /* The mesh tolerates a peer's disk-bound Engram stall on every gate. */
+    if (ds4_tp_world(tp) == 3) ds4_gpu_tp_set_wait_timeouts(300u, 300u);
+#endif
 #if defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     g_tp_block_ctx = tp;
 #endif

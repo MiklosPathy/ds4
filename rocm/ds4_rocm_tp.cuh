@@ -201,6 +201,13 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
     g_rocm_tp.started = true;
     return 1;
 }
+extern "C" void ds4_gpu_tp_set_wait_timeouts(uint32_t scalar_sec, uint32_t bulk_sec) {
+    int device, khz;
+    if (hipGetDevice(&device) != hipSuccess ||
+        hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device) != hipSuccess || khz <= 0) return;
+    if (scalar_sec) g_rocm_tp.timeout_ticks = (uint64_t)khz * 1000u * scalar_sec;
+    if (bulk_sec) g_rocm_tp.bulk_timeout_ticks = (uint64_t)khz * 1000u * bulk_sec;
+}
 extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) { g_rocm_tp.batch = fn; }
 extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) { g_rocm_tp.big = fn; }
 extern "C" void ds4_gpu_tp_set_session_batch_mode(int enabled) { (void)enabled; }

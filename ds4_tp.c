@@ -2779,14 +2779,18 @@ static int tp3_gate(ds4_tp *tp, uint32_t kind, uint32_t layer, uint32_t gate,
     /* Bulk prefill gates legitimately wait for a peer that is still reading
      * Engram rows from disk; only decode gates keep the short stall limit. A
      * dead peer still fails at once through the socket error. */
+    /* Decode gates likewise wait while a peer's per-token Engram read hits
+     * disk. Metal needs the short limit for its GPU watchdog; the ROCm mesh
+     * does not, and a dead peer still fails at once through the socket. */
     uint64_t stall_ms = tp->gate_timeout_ms + grace_ms;
-    if (kind == 3 && stall_ms < tp->timeout_sec * 1000u) stall_ms = tp->timeout_sec * 1000u;
+    if (stall_ms < tp->timeout_sec * 1000u) stall_ms = tp->timeout_sec * 1000u;
     const double wait0 = tp_now_sec();
     if (!tp3_exchange(tp, &h, peer, sizeof(h), out, bytes, stall_ms)) goto fail;
     const double t1 = tp_now_sec();
-    if (kind == 3 && t1 - wait0 > 1.0)
-        fprintf(stderr, "ds4-tp3: rank %d waited %.1f s for peers at layer %u (bulk gate seq %llu)\n",
-                tp->rank, t1 - wait0, layer, (unsigned long long)seq);
+    if (t1 - wait0 > (kind == 3 ? 1.0 : 0.25))
+        fprintf(stderr, "ds4-tp3: rank %d waited %.2f s for peers at layer %u (%s gate seq %llu)\n",
+                tp->rank, t1 - wait0, layer, kind == 3 ? "bulk" : "decode",
+                (unsigned long long)seq);
     if (memcmp(&h, &peer[0], sizeof(h)) || memcmp(&h, &peer[1], sizeof(h))) {
         errno = EPROTO;
         goto fail;

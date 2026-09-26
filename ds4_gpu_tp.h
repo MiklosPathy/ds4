@@ -60,6 +60,8 @@ int ds4_gpu_tp_big_gate_begin(uint32_t layer, uint32_t rows,
                             ds4_gpu_tensor *in_t, uint64_t bytes);
 int ds4_gpu_tp_big_gate_join(uint32_t layer, uint32_t rows,
                            ds4_gpu_tensor *in_t, uint64_t bytes);
+/* GPU-side gate wait limits in seconds; zero keeps the current value. */
+void ds4_gpu_tp_set_wait_timeouts(uint32_t scalar_sec, uint32_t bulk_sec);
 /* Fail the gate and drain GPU users before releasing private scratch. */
 void ds4_gpu_tp_big_gate_abort(void);
 /* Host-coherent slab allocation; views preserve host/device aliases. */
