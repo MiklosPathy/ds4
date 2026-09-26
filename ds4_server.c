@@ -15334,8 +15334,11 @@ static bool send_props(server *s, int fd) {
     json_escape(&b, s->model_path ? s->model_path : model_name);
     buf_puts(&b,
         ",\"model_ftype\":\"\","
-        "\"role\":\"model\","
-        "\"modalities\":{\"vision\":false,\"audio\":false,\"video\":false},"
+        "\"role\":\"model\",");
+    /* The web UI enables image attachments only when vision is advertised. */
+    buf_printf(&b, "\"modalities\":{\"vision\":%s,\"audio\":false,\"video\":false},",
+               ds4_engine_has_vision(s->engine) ? "true" : "false");
+    buf_puts(&b,
         "\"media_marker\":\"<__media__>\","
         "\"endpoint_slots\":false,"
         "\"endpoint_props\":false,"
