@@ -15216,6 +15216,31 @@ static const char *mime_from_ext(const char *path) {
     return "application/octet-stream";
 }
 
+/* The default relative "webui" is looked up in the working directory first,
+ * then next to the executable, so starting ds4-server from another directory
+ * still serves the UI. An explicit --webui-dir is used as given. */
+static const char *server_resolve_webui_dir(const char *dir) {
+    static char exe_dir[PATH_MAX];
+    struct stat st;
+    if (!dir || strcmp(dir, "webui") != 0) return dir;
+    if (stat("webui/index.html", &st) == 0) return dir;
+#ifdef __linux__
+    ssize_t n = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
+    if (n <= 0) return dir;
+    exe_dir[n] = 0;
+    char *slash = strrchr(exe_dir, '/');
+    if (!slash) return dir;
+    const size_t used = (size_t)(slash - exe_dir);
+    if (used + sizeof("/webui/index.html") > sizeof(exe_dir)) return dir;
+    memcpy(slash, "/webui/index.html", sizeof("/webui/index.html"));
+    if (stat(exe_dir, &st) != 0) return dir;
+    exe_dir[used + sizeof("/webui") - 1] = 0;
+    return exe_dir;
+#else
+    return dir;
+#endif
+}
+
 static bool webui_path_is_safe(const char *rel_path) {
     if (!rel_path[0] || rel_path[0] == '/') return false;
     if (strstr(rel_path, "..")) return false;
@@ -16227,7 +16252,7 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
-    s.webui_dir = cfg.webui_dir;
+    s.webui_dir = server_resolve_webui_dir(cfg.webui_dir);
     s.model_path = cfg.engine.model_path;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
