@@ -256,6 +256,8 @@ static void print_distributed(FILE *fp, const help_colors *c) {
     opt(fp, c, "--tensor-parallel", "Switch --role/--listen/--coordinator to two-machine tensor parallelism.");
     opt(fp, c, "--transport auto|rdma|tcp", "Tensor gate transport. Default: auto");
 #if defined(__linux__) && defined(DS4_ROCM_BUILD)
+    opt(fp, c, "--tensor-parallel3", "V4.1 ROCm: three machines in a full TCP mesh, one third of the experts each. Workers also pass --tp-rank.");
+    opt(fp, c, "--tp-rank 1|2", "Worker rank for --tensor-parallel3. Rank 1 also listens on the coordinator port + 1 for rank 2.");
     opt(fp, c, "--rdma-port N", "Select the local active Ethernet verbs port. Default: 1");
 #endif
     opt(fp, c, "--rdma-device NAME", "Select a verbs device when auto-detection is ambiguous.");
