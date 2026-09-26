@@ -1205,6 +1205,12 @@ tests/test_deepseek41_attention_gufo_rocm.o: tests/test_deepseek41_attention_guf
 ds4-kernel-v41-attention-gufo: tests/test_deepseek41_attention_gufo_rocm.o ds4_rocm.o ds4_image.rocm.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
+tests/test_deepseek41_tp3_rocm.o: tests/test_deepseek41_tp3_rocm.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -ffp-contract=off $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+ds4-kernel-v41-tp3: tests/test_deepseek41_tp3_rocm.o ds4_rocm.o ds4_image.rocm.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
 ds4-kernel-v41: tests/test_deepseek41_rocm.o ds4_rocm.o ds4_image.rocm.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
@@ -1301,6 +1307,13 @@ tests/test_tp_linux: tests/test_tp_linux.c ds4_tp.c ds4_tp_io.h ds4_tp_roce.h ds
 .PHONY: test-tp-linux
 test-tp-linux: tests/test_tp_linux
 	./tests/test_tp_linux
+
+tests/test_tp3_mesh: tests/test_tp3_mesh.c ds4_tp.c ds4_tp_io.h ds4_tp_roce.h ds4_tp.h ds4.h
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -o $@ $< -Wl,--gc-sections -pthread -lm
+
+.PHONY: test-tp3-mesh
+test-tp3-mesh: tests/test_tp3_mesh
+	./tests/test_tp3_mesh
 endif
 
 tests/test_tp_rdma.o: tests/test_tp_rdma.c ds4_tp.c ds4_tp.h ds4.h ds4_gpu_tp.h
@@ -1546,8 +1559,8 @@ clean:
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm tests/test_cuda_tokentile
 	rm -f tests/test_ssd_cache tests/test_engram
-	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands tests/test_tp_linux
-	rm -f ds4-kernel-v41-mxfp4-tp
+	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands tests/test_tp_linux tests/test_tp3_mesh
+	rm -f ds4-kernel-v41-mxfp4-tp ds4-kernel-v41-tp3
 	rm -f ds4-kernel-v41-tp-bind-failure ds4-kernel-v41-tp-attention ds4-kernel-v41-attention-gufo ds4-kernel-v41-tp-moe ds4-kernel-v41-tp-gates ds4-kernel-v41-tp-mmq ds4-kernel-v41-tp-down
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp
 	rm -f tests/test_deepseek_indexer tests/test_cuda_tp_link

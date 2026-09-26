@@ -77,8 +77,9 @@ static __global__ void rocm_tp_add(rocm_tp_shared *s, unsigned slot, uint64_t se
                                   float *out, const float *a, const float *b, uint32_t n) {
     if (rocm_tp_aborted(s) ||
         __hip_atomic_load(&s->slots[slot].done, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != seq) return;
+    /* Three-rank gates deliver the finished rank-ordered sum in a. */
     for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (uint64_t)gridDim.x * blockDim.x)
-        out[i] = a[i] + b[i];
+        out[i] = b ? a[i] + b[i] : a[i];
 }
 static __global__ void rocm_tp_release(rocm_tp_shared *s, unsigned slot, uint64_t seq) {
     __hip_atomic_store(&s->slots[slot].consumed, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -103,7 +104,7 @@ static __global__ void rocm_tp_wait_add_release(rocm_tp_shared *s, unsigned slot
     }
     __syncthreads();
     if (ok)
-        for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) out[i] = a[i] + b[i];
+        for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) out[i] = b ? a[i] + b[i] : a[i];
     __syncthreads();
     if (threadIdx.x == 0)
         __hip_atomic_store(&s->slots[slot].consumed, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -173,7 +174,7 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
 extern "C" int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
         uint64_t gpu_flags_off, uint64_t out_off, uint64_t vec_bytes,
         ds4_gpu_tp_exchange_fn fn, void *ud) {
-    if (g_rocm_tp.active || !g_deepseek41_model || rank > 1u ||
+    if (g_rocm_tp.active || !g_deepseek41_model || rank > 2u ||
         !slab || !slab->host_ptr || !fn || vec_bytes != 20480u ||
         gpu_flags_off > slab->bytes || 80u * sizeof(uint32_t) > slab->bytes - gpu_flags_off ||
         out_off > slab->bytes || 80u * vec_bytes > slab->bytes - out_off) return 0;
@@ -298,17 +299,18 @@ extern "C" int ds4_gpu_tp_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
                                      const ds4_gpu_tensor *b, uint32_t n) {
     const uint64_t seq = g_rocm_tp.pending;
     const uint64_t bytes = (uint64_t)n * 4;
-    if (!g_rocm_tp.active || !seq || g_rocm_tp.pending_deferred || !out || !a || !b || n != g_rocm_tp.pending_count ||
-        bytes > out->bytes || bytes > a->bytes || bytes > b->bytes || ds4_gpu_tp_failed()) return rocm_tp_fail();
+    /* b == NULL: a already holds the complete three-rank sum. */
+    if (!g_rocm_tp.active || !seq || g_rocm_tp.pending_deferred || !out || !a || n != g_rocm_tp.pending_count ||
+        bytes > out->bytes || bytes > a->bytes || (b && bytes > b->bytes) || ds4_gpu_tp_failed()) return rocm_tp_fail();
     const unsigned slot = (unsigned)((seq - 1) % ROCM_TP_QUEUE);
     /* Avoid coherent guard loads from idle workgroups on scalar payloads.
      * The grid-stride loop preserves full coverage for larger batches. */
     const uint32_t blocks = n / 256u + (n % 256u != 0u);
     if (n == 5120u && g_rocm_tp.jobs[slot].kind == 0 && rocm_tp_fused_scalar_gate()) {
         rocm_tp_wait_add_release<<<1, 1024>>>(g_rocm_tp.device, slot, seq, g_rocm_tp.timeout_ticks,
-                (float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
+                (float *)out->ptr, (const float *)a->ptr, b ? (const float *)b->ptr : nullptr, n);
     } else {
-        rocm_tp_add<<<blocks < 256u ? blocks : 256u, 256>>>(g_rocm_tp.device, slot, seq, (float *)out->ptr, (const float *)a->ptr, (const float *)b->ptr, n);
+        rocm_tp_add<<<blocks < 256u ? blocks : 256u, 256>>>(g_rocm_tp.device, slot, seq, (float *)out->ptr, (const float *)a->ptr, b ? (const float *)b->ptr : nullptr, n);
         rocm_tp_release<<<1, 1>>>(g_rocm_tp.device, slot, seq);
     }
     g_rocm_tp.pending = 0;

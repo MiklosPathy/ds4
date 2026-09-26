@@ -134,3 +134,5 @@ ds4-kernel-v41-tp-gates
 /tests/test_halo_shapes
 
 /ds4-kernel-halo-moe
+/tests/test_tp3_mesh
+ds4-kernel-v41-tp3
