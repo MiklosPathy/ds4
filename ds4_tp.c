@@ -2761,8 +2761,12 @@ static int tp3_gate(ds4_tp *tp, uint32_t kind, uint32_t layer, uint32_t gate,
     }
     ds4_tp_linux_gate_header h = {DS4_TP3_MAGIC, kind, layer, gate,
                                   tp->epoch, seq, bytes}, peer[2];
+    static int profile = -1;
+    if (profile < 0) profile = getenv("DS4_TP3_PROFILE") != NULL;
+    const double t0 = profile ? tp_now_sec() : 0.0;
     if (!tp3_exchange(tp, &h, peer, sizeof(h), out, bytes,
                       tp->gate_timeout_ms + grace_ms)) goto fail;
+    const double t1 = profile ? tp_now_sec() : 0.0;
     if (memcmp(&h, &peer[0], sizeof(h)) || memcmp(&h, &peer[1], sizeof(h))) {
         errno = EPROTO;
         goto fail;
@@ -2774,6 +2778,25 @@ static int tp3_gate(ds4_tp *tp, uint32_t kind, uint32_t layer, uint32_t gate,
     const uint64_t n = bytes / sizeof(float);
     /* Same operand order on every rank: bit-identical replicated state. */
     for (uint64_t i = 0; i < n; i++) dst[i] = (src[0][i] + src[1][i]) + src[2][i];
+    if (profile) {
+        /* Per kind: count, bytes, exchange and reduction seconds. */
+        static double stats[4][4];
+        static double last_report;
+        const uint32_t k = kind < 4 ? kind : 3;
+        const double t2 = tp_now_sec();
+        stats[k][0] += 1; stats[k][1] += (double)bytes;
+        stats[k][2] += t1 - t0; stats[k][3] += t2 - t1;
+        if (t2 - last_report > 5.0) {
+            last_report = t2;
+            for (int i = 0; i < 4; i++) {
+                if (!stats[i][0]) continue;
+                fprintf(stderr, "ds4-tp3: rank %d kind %d: %.0f gates, %.1f MiB, exchange %.1f ms (avg %.3f), reduce %.1f ms\n",
+                        tp->rank, i, stats[i][0], stats[i][1] / 1048576.0, stats[i][2] * 1e3,
+                        stats[i][2] * 1e3 / stats[i][0], stats[i][3] * 1e3);
+                memset(stats[i], 0, sizeof(stats[i]));
+            }
+        }
+    }
     return 1;
 fail:
     fprintf(stderr, "ds4-tp3: gate failed (rank=%d layer=%u kind=%u seq=%llu bytes=%llu): %s\n",

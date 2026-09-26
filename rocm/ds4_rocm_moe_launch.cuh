@@ -2941,6 +2941,63 @@ extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
         (int32_t *)selected->ptr, (float *)weights->ptr, pair_count,
         n_total_expert, resident_expert_base, resident_expert_count, foreign);
     if (!cuda_ok(cudaGetLastError(), "owned routed_moe pair filter")) return 0;
+    const bool q4k = gate_type == 12u && down_type == 12u;
+    if (q4k && n_tokens >= 32u && resident_expert_count >= n_expert &&
+        ds4_rocm_is_gfx1151() && !g_quality_mode &&
+        !getenv("DS4_ROCM_TP3_DISABLE_MMQ") &&
+        expert_in_dim % 256u == 0u && expert_mid_dim % 256u == 0u &&
+        gate->bytes >= pair_count * expert_mid_dim * sizeof(float) &&
+        up->bytes >= pair_count * expert_mid_dim * sizeof(float) &&
+        mid->bytes >= pair_count * expert_mid_dim * sizeof(float) &&
+        down->bytes >= pair_count * out_dim * sizeof(float) &&
+        out->bytes >= (uint64_t)n_tokens * out_dim * sizeof(float)) {
+        /* Prefill: MMQ over this rank's experts. Foreign slots carry a
+         * nonmatching id, so the ids helper assigns them no work. */
+        const uint64_t owned_gate = (uint64_t)resident_expert_count * gate_expert_bytes;
+        const uint64_t owned_down = (uint64_t)resident_expert_count * down_expert_bytes;
+        const char *gw = cuda_model_range_ptr(model_map, gate_offset + gate_shift, owned_gate, "TP3 owned gate");
+        const char *uw = cuda_model_range_ptr(model_map, up_offset + gate_shift, owned_gate, "TP3 owned up");
+        const char *dw = cuda_model_range_ptr(model_map, down_offset + down_shift, owned_down, "TP3 owned down");
+        int rc = gw && uw && dw && ds4_mmq_init(0) == 0 ? 0 : -1;
+        const uint32_t cap = 2048u; /* the MMQ pair is qualified through 2048 rows */
+        for (uint32_t t0 = 0; rc == 0 && t0 < n_tokens; ) {
+            const uint32_t rows = n_tokens - t0 < cap ? n_tokens - t0 : cap;
+            const uint64_t p0 = (uint64_t)t0 * n_expert;
+            rc = ds4_mmq_q4_K_moe_pair(gw, uw, (const float *)x->ptr + (uint64_t)t0 * expert_in_dim,
+                (const int32_t *)selected->ptr + p0,
+                (float *)gate->ptr + p0 * expert_mid_dim, (float *)up->ptr + p0 * expert_mid_dim,
+                (int)expert_mid_dim, (int)expert_in_dim, (int)rows,
+                (int)resident_expert_count, (int)n_expert, (cudaStream_t)0);
+            t0 += rows;
+        }
+        if (rc == 0) {
+            /* Zero weights turn unwritten foreign gate/up rows into zero mid. */
+            const uint64_t mid_count = pair_count * expert_mid_dim;
+            moe_swiglu_weighted_f32_kernel<<<(uint32_t)((mid_count + 255u) / 256u), 256>>>(
+                (float *)mid->ptr, (const float *)gate->ptr, (const float *)up->ptr,
+                (const float *)weights->ptr, mid_count, expert_mid_dim, clamp);
+            rc = cuda_ok(cudaGetLastError(), "TP3 MMQ swiglu") ? 0 : -1;
+        }
+        const uint32_t pair_cap = cap;
+        for (uint64_t q0 = 0; rc == 0 && q0 < pair_count; ) {
+            const uint32_t rows = pair_count - q0 < pair_cap ? (uint32_t)(pair_count - q0) : pair_cap;
+            rc = ds4_mmq_q4_K_moe(dw, (const float *)mid->ptr + q0 * expert_mid_dim,
+                (const int32_t *)selected->ptr + q0, (float *)down->ptr + q0 * out_dim,
+                (int)out_dim, (int)expert_mid_dim, (int)rows,
+                (int)resident_expert_count, 1, (cudaStream_t)0);
+            q0 += rows;
+        }
+        if (rc == 0) {
+            const uint64_t n = (uint64_t)n_tokens * out_dim;
+            moe_sum_owned_kernel<<<(uint32_t)((n + 255u) / 256u), 256>>>((float *)out->ptr,
+                (const float *)down->ptr, (const int32_t *)selected->ptr, out_dim, n_expert, n_tokens);
+            if (cuda_ok(cudaGetLastError(), "TP3 MMQ sum")) return 1;
+            rc = -1;
+        }
+        fprintf(stderr, "ds4: TP3 Q4_K MMQ routed MoE failed (rc=%d, layer=%u, rows=%u)\n",
+                rc, layer_index, n_tokens);
+        return 0;
+    }
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset + gate_shift, up_offset + gate_shift,
                              down_offset + down_shift, gate_type, down_type,
