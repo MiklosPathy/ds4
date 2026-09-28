@@ -43278,7 +43278,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     if (dspark_profile) dspark_profile_left--;
     double profile_setup = 0.0, profile_pre_attn = 0.0, profile_attn = 0.0;
     double profile_post_attn = 0.0, profile_moe = 0.0, profile_post_moe = 0.0;
-    double profile_head = 0.0, profile_t0 = now_sec();
+    double profile_head = 0.0, profile_engram_host = 0.0, profile_t0 = now_sec();
+    double profile_pre_attn_layer[DS4_MAX_LAYER] = {0};
+    double profile_attn_layer[DS4_MAX_LAYER] = {0};
+    double profile_post_attn_layer[DS4_MAX_LAYER] = {0};
+    double profile_moe_layer[DS4_MAX_LAYER] = {0};
+    double profile_post_moe_layer[DS4_MAX_LAYER] = {0};
 #endif
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
@@ -43304,6 +43309,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ok = queries[i] && heads[i];
     }
     const float initial_pre[] = {1, 0, 0, 0};
+#ifdef DS4_ROCM_BUILD
+    const double engram_t0 = dspark_profile ? now_sec() : 0.0;
+#endif
     for (int i = 0; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
         uint32_t ids[2][DS4_ENGRAM_COLS];
@@ -43319,6 +43327,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
     }
+#ifdef DS4_ROCM_BUILD
+    if (dspark_profile) profile_engram_host += now_sec() - engram_t0;
+#endif
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
 #ifdef DS4_ROCM_BUILD
     if (dspark_profile && ok) {
@@ -43348,7 +43359,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #ifdef DS4_ROCM_BUILD
         if (dspark_profile && ok) {
             ok = ds4_gpu_synchronize();
-            profile_pre_attn += now_sec() - profile_t0;
+            profile_pre_attn_layer[il] = now_sec() - profile_t0;
+            profile_pre_attn += profile_pre_attn_layer[il];
             profile_t0 = now_sec();
         }
 #endif
@@ -43391,7 +43403,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #ifdef DS4_ROCM_BUILD
         if (dspark_profile && ok) {
             ok = ds4_gpu_synchronize();
-            profile_attn += now_sec() - profile_t0;
+            profile_attn_layer[il] = now_sec() - profile_t0;
+            profile_attn += profile_attn_layer[il];
             profile_t0 = now_sec();
         }
 #endif
@@ -43405,7 +43418,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #ifdef DS4_ROCM_BUILD
         if (dspark_profile && ok) {
             ok = ds4_gpu_synchronize();
-            profile_post_attn += now_sec() - profile_t0;
+            profile_post_attn_layer[il] = now_sec() - profile_t0;
+            profile_post_attn += profile_post_attn_layer[il];
             profile_t0 = now_sec();
         }
 #endif
@@ -43413,7 +43427,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #ifdef DS4_ROCM_BUILD
         if (dspark_profile && ok) {
             ok = ds4_gpu_synchronize();
-            profile_moe += now_sec() - profile_t0;
+            profile_moe_layer[il] = now_sec() - profile_t0;
+            profile_moe += profile_moe_layer[il];
             profile_t0 = now_sec();
         }
 #endif
@@ -43428,7 +43443,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #ifdef DS4_ROCM_BUILD
         if (dspark_profile && ok) {
             ok = ds4_gpu_synchronize();
-            profile_post_moe += now_sec() - profile_t0;
+            profile_post_moe_layer[il] = now_sec() - profile_t0;
+            profile_post_moe += profile_post_moe_layer[il];
         }
 #endif
         /* The second Engram upload reuses the first one's input storage. */
@@ -43476,13 +43492,27 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         profile_head += now_sec() - profile_t0;
         fprintf(stderr,
             "ds4: V4.1 DSpark verify profile rows=%u setup=%.3f pre_attn=%.3f "
-            "attn=%.3f post_attn=%.3f moe=%.3f post_moe=%.3f head=%.3f total=%.3f ms\n",
+            "engram_host=%.3f attn=%.3f post_attn=%.3f moe=%.3f post_moe=%.3f "
+            "head=%.3f total=%.3f ms\n",
             rows, profile_setup * 1000.0, profile_pre_attn * 1000.0,
+            profile_engram_host * 1000.0,
             profile_attn * 1000.0, profile_post_attn * 1000.0,
             profile_moe * 1000.0, profile_post_moe * 1000.0,
             profile_head * 1000.0,
             (profile_setup + profile_pre_attn + profile_attn + profile_post_attn +
              profile_moe + profile_post_moe + profile_head) * 1000.0);
+        for (uint32_t layer = 0; layer < DS4_N_LAYER; layer++)
+            fprintf(stderr,
+                "ds4: V4.1 DSpark verify layer=%u pre_attn=%.3f attn=%.3f "
+                "post_attn=%.3f moe=%.3f post_moe=%.3f total=%.3f ms\n",
+                layer, profile_pre_attn_layer[layer] * 1000.0,
+                profile_attn_layer[layer] * 1000.0,
+                profile_post_attn_layer[layer] * 1000.0,
+                profile_moe_layer[layer] * 1000.0,
+                profile_post_moe_layer[layer] * 1000.0,
+                (profile_pre_attn_layer[layer] + profile_attn_layer[layer] +
+                 profile_post_attn_layer[layer] + profile_moe_layer[layer] +
+                 profile_post_moe_layer[layer]) * 1000.0);
     }
 #endif
     ds4_gpu_tensor_free(batch_logits);

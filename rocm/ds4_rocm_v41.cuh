@@ -888,25 +888,36 @@ extern "C" int ds4_gpu_dsv41_hc_project(ds4_gpu_dsv41_hc_plan **plan,
 /* Default Engram lane l consumes l+32*i, i=0..191, then the existing
  * shuffle16/8/4/2/1. Each token retains an independent accumulation chain.
  * Only F32 input reuse across the eight output waves changes. */
-template<unsigned TT>
+template<unsigned TT,unsigned WAVES=8,unsigned SEG=256>
 __global__ static void engram_lds_token_reuse(float *out,const __half *w,const float *x) {
-    constexpr unsigned K=6144,N=25600,WAVES=8,SEG=256;
+    constexpr unsigned K=6144,N=25600;
+    static_assert(K % SEG == 0, "Engram LDS segment must divide K");
     const unsigned tid=threadIdx.x,lane=tid&31u,wave=tid>>5u;
     const unsigned row=blockIdx.x*WAVES+wave,token=blockIdx.y*TT;
     __shared__ float tile[TT][SEG];
     float acc[TT]={};
     for(unsigned base=0;base<K;base+=SEG) {
-        for(unsigned j=tid;j<TT*SEG;j+=256u) {
+        for(unsigned j=tid;j<TT*SEG;j+=WAVES*32u) {
             const unsigned t=j/SEG,k=j%SEG;
             tile[t][k]=x[(uint64_t)(token+t)*K+base+k];
         }
         __syncthreads();
+        /* Match the scalar production kernel's eight explicit FMAs per
+         * 256-wide group. Keeping that loop shape preserves bitwise parity
+         * under the production fast-math flags. */
+        for(unsigned group=0;group<SEG;group+=256u) {
+            const unsigned k=group+lane;
 #pragma unroll
-        for(unsigned step=0;step<8;step++) {
-            const unsigned k=step*32u+lane;
-            const float weight=__half2float(w[(uint64_t)row*K+base+k]);
-#pragma unroll
-            for(unsigned t=0;t<TT;t++)acc[t]+=weight*tile[t][k];
+            for(unsigned t=0;t<TT;t++) {
+                acc[t]+=__half2float(w[(uint64_t)row*K+base+k])*tile[t][k];
+                acc[t]+=__half2float(w[(uint64_t)row*K+base+k+32u])*tile[t][k+32u];
+                acc[t]+=__half2float(w[(uint64_t)row*K+base+k+64u])*tile[t][k+64u];
+                acc[t]+=__half2float(w[(uint64_t)row*K+base+k+96u])*tile[t][k+96u];
+                acc[t]+=__half2float(w[(uint64_t)row*K+base+k+128u])*tile[t][k+128u];
+                acc[t]+=__half2float(w[(uint64_t)row*K+base+k+160u])*tile[t][k+160u];
+                acc[t]+=__half2float(w[(uint64_t)row*K+base+k+192u])*tile[t][k+192u];
+                acc[t]+=__half2float(w[(uint64_t)row*K+base+k+224u])*tile[t][k+224u];
+            }
         }
         // Every reader finishes before any thread overwrites the next segment.
         __syncthreads();
@@ -952,6 +963,25 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
         !cuda_u64_mul3_checked(width, outputs, sizeof(uint16_t), &weight_bytes) ||
         !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
         !cuda_tensor_has_elems2(in, width, rows, 4u) || !cuda_tensor_has_elems2(out, outputs, rows, 4u)) return 0;
+    if (width == 6144u && outputs == 25600u && rows >= 2u && rows <= 6u &&
+        ds4_rocm_is_gfx1151() && !cuda_runtime_config()->graph_dump) {
+        const __half *w = (const __half *)cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes, "V4.1 exact Engram F16");
+        if (!w) return 0;
+        switch (rows) {
+        case 2u: engram_lds_token_reuse<2,2,768><<<12800u, 64u>>>(
+            (float *)out->ptr, w, (const float *)in->ptr); break;
+        case 3u: engram_lds_token_reuse<3,4,1024><<<6400u, 128u>>>(
+            (float *)out->ptr, w, (const float *)in->ptr); break;
+        case 4u: engram_lds_token_reuse<4,8,1024><<<3200u, 256u>>>(
+            (float *)out->ptr, w, (const float *)in->ptr); break;
+        case 5u: engram_lds_token_reuse<5,4,1024><<<6400u, 128u>>>(
+            (float *)out->ptr, w, (const float *)in->ptr); break;
+        case 6u: engram_lds_token_reuse<6,4,512><<<6400u, 128u>>>(
+            (float *)out->ptr, w, (const float *)in->ptr); break;
+        }
+        return cuda_ok(cudaGetLastError(), "V4.1 exact tiny-row Engram projection");
+    }
     if (width == 6144u && outputs == 25600u && rows >= 32u && rows <= 2048u &&
         ds4_rocm_is_gfx1151() && !g_quality_mode && !cuda_runtime_config()->graph_dump) {
         const __half *w = (const __half *)cuda_model_range_ptr(
