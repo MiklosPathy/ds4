@@ -1169,14 +1169,31 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
         matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 16u><<<dim3(outputs / 256u, (rows + 63u) / 64u), 512u>>>(
             (float *)out->ptr, weights, (const float *)in->ptr,
             rows, width, outputs, UINT64_C(40) * 34u);
-    } else if (!g_quality_mode && rows == 2048u && ds4_rocm_is_gfx1151() &&
+    } else if (!g_quality_mode && rows >= 32u && rows <= 2048u && rows != 128u && ds4_rocm_is_gfx1151() &&
                ((width == 5120u && (outputs == 512u || outputs == 1280u || outputs == 2304u)) ||
                 (width == 2304u && outputs == 5120u))) {
-        /* Query-A, KV and shared-expert projections on a complete prefill tile.
-         * Reuse the generic Q8-to-F16 WMMA path and its F32 accumulation. */
-        matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u><<<dim3(outputs / 128u, 32u), 256u>>>(
-            (float *)out->ptr, weights, (const float *)in->ptr,
-            rows, width, outputs, (uint64_t)(width / 32u) * 34u);
+        /* Query-A, KV and shared-expert projections on prefill/replay tiles.
+         * The shared-F32 path remains faster for the bounded 128-row tile.
+         * A two-host, full-oracle sweep selected the 256-row/pad-8 tile for
+         * the bulk of this topology.  The 32-row input-limited shape favors
+         * 128 rows/pad-8, while Query-A crosses back to the 128-row tile at
+         * the final 1984-row grid step. */
+        if (width == 5120u && rows <= 32u) {
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u, 8u>
+                <<<dim3((outputs + 127u) / 128u, (rows + 63u) / 64u), 256u>>>(
+                    (float *)out->ptr, weights, (const float *)in->ptr,
+                    rows, width, outputs, (uint64_t)(width / 32u) * 34u);
+        } else if (width == 5120u && outputs == 512u && rows >= 1984u) {
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u>
+                <<<dim3((outputs + 127u) / 128u, (rows + 63u) / 64u), 256u>>>(
+                    (float *)out->ptr, weights, (const float *)in->ptr,
+                    rows, width, outputs, (uint64_t)(width / 32u) * 34u);
+        } else {
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 8u>
+                <<<dim3((outputs + 255u) / 256u, (rows + 63u) / 64u), 512u>>>(
+                    (float *)out->ptr, weights, (const float *)in->ptr,
+                    rows, width, outputs, (uint64_t)(width / 32u) * 34u);
+        }
     } else if (width == 1280u && outputs == 32768u && rows >= 32u && rows <= 2048u && ds4_rocm_is_gfx1151()) {
         /* Reuse sixteen query-B activation rows with the same F32 lane
          * accumulation and wave reduction; keep the existing block tile. */

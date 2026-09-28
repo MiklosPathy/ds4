@@ -924,6 +924,85 @@ static double projection_roundoff_bound(double magnitude, unsigned width) {
     return (f32 / (1.0 - f32) + f64 / (1.0 - f64)) * magnitude;
 }
 
+static uint32_t q8_prefill_column(uint32_t output, uint32_t term, uint32_t width) {
+    return (output * 131u + term * 503u) % width;
+}
+
+static int q8_prefill_coefficient(uint32_t output, uint32_t term) {
+    return (int)((output + term * 3u) % 7u) - 3;
+}
+
+static int check_q8_prefill_projection(void) {
+    static const struct { uint32_t width, output; } dimensions[] = {
+        {5120u, 512u}, {5120u, 1280u}, {5120u, 2304u}, {2304u, 5120u},
+    };
+    static const uint32_t row_counts[] = {
+        32u, 127u, 128u, 129u, 1920u, 1984u, 2048u,
+    };
+    enum { TERMS = 8 };
+    const unsigned dimension = requested_shape / (sizeof(row_counts) / sizeof(*row_counts));
+    const unsigned row_shape = requested_shape % (sizeof(row_counts) / sizeof(*row_counts));
+    const uint32_t width = dimensions[dimension].width;
+    const uint32_t output = dimensions[dimension].output;
+    const uint32_t rows = row_counts[row_shape];
+    const size_t blocks_per_row = width / 32u;
+    const size_t weight_bytes = (size_t)output * blocks_per_row * sizeof(fixture_q8);
+    const size_t input_values = (size_t)rows * width;
+    const size_t output_values = (size_t)rows * output;
+    void *model = NULL;
+    CHECK(!posix_memalign(&model, (size_t)sysconf(_SC_PAGESIZE), weight_bytes));
+    memset(model, 0, weight_bytes);
+    fixture_q8 *weights = model;
+    for (uint32_t out = 0; out < output; out++) for (uint32_t term = 0; term < TERMS; term++) {
+        const uint32_t column = q8_prefill_column(out, term, width);
+        fixture_q8 *block = &weights[(size_t)out * blocks_per_row + column / 32u];
+        block->scale = 0x2000u;
+        block->q[column % 32u] = (int8_t)q8_prefill_coefficient(out, term);
+    }
+    float *input = malloc(input_values * sizeof(*input));
+    float *actual = malloc(output_values * sizeof(*actual));
+    CHECK(input && actual);
+    for (size_t i = 0; i < input_values; i++)
+        input[i] = ((int)((i * 37u + 19u) % 257u) - 128) / 31.0f +
+            ((i & 1u) ? 0.00012345f : -0.00012345f);
+    CHECK(ds4_gpu_set_model_map(model, weight_bytes));
+    ds4_gpu_tensor *input_tensor = upload(input, input_values * sizeof(*input));
+    ds4_gpu_tensor *output_tensor = upload(NULL, output_values * sizeof(*actual));
+    CHECK(input_tensor && output_tensor);
+    RUN(ds4_gpu_dsv41_q8_projection_rows(output_tensor, model, weight_bytes, 0,
+        width, output, rows, input_tensor));
+    CHECK(ds4_gpu_tensor_read(output_tensor, 0, actual, output_values * sizeof(*actual)));
+    double worst_fraction = 0.0;
+    for (uint32_t row = 0; row < rows; row++) for (uint32_t out = 0; out < output; out++) {
+        double sum = 0.0, magnitude = 0.0;
+        for (uint32_t term = 0; term < TERMS; term++) {
+            const uint32_t column = q8_prefill_column(out, term, width);
+            const float activation = rows == 128u ? input[(size_t)row * width + column]
+                                                   : reference_f16(input[(size_t)row * width + column]);
+            const double product = (double)activation *
+                q8_prefill_coefficient(out, term) / 128.0;
+            sum += product;
+            magnitude += fabs(product);
+        }
+        const float got = actual[(size_t)row * output + out];
+        const double tolerance = projection_roundoff_bound(magnitude, width) + 0x1p-22;
+        const double error = fabs((double)got - sum);
+        CHECK(isfinite(got) && error <= tolerance);
+        worst_fraction = fmax(worst_fraction, error / tolerance);
+    }
+    fprintf(stderr, "Q8 prefill projection width=%u output=%u rows=%u full %s/F32 oracle worst_fraction=%.9g\n",
+            width, output, rows, rows == 128u ? "F32" : "F16", worst_fraction);
+    CHECK(!ds4_gpu_dsv41_q8_projection_rows(output_tensor, model, weight_bytes - 1u, 0,
+        width, output, rows, input_tensor));
+    CHECK(!ds4_gpu_dsv41_q8_projection_rows(output_tensor, model, weight_bytes, 0,
+        width, output, rows + 1u, input_tensor));
+    ds4_gpu_tensor_free(output_tensor);
+    ds4_gpu_tensor_free(input_tensor);
+    ds4_gpu_cleanup();
+    free(model); free(input); free(actual);
+    return ds4_gpu_init();
+}
+
 static int check_attention_output(void) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120, TERMS = 8 };
     const uint32_t counts[] = {1,31,32,33,65,513}, rows = counts[requested_shape];
@@ -1106,6 +1185,7 @@ static const test_case cases[] = {
     {"dspark-markov", 3, check_dspark_markov},
     {"projection", 11, check_projection},
     {"hc", 4, check_hc_scaled},
+    {"q8-prefill-projection", 28, check_q8_prefill_projection},
     {"attention-output", 6, check_attention_output},
 };
 
