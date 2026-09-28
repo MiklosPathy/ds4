@@ -579,6 +579,227 @@ static float fixture_half(uint16_t bits) {
     return (1.0f + (bits & 1023) / 1024.0f) / 128.0f * (bits & 0x8000 ? -1.0f : 1.0f);
 }
 
+static int check_dspark_hc_mean(void) {
+    const struct { uint32_t rows, dim, hc, stride, off; } shapes[] = {
+        {1, 32, 1, 32, 0}, {5, 64, 4, 192, 64}, {33, 5120, 4, 15360, 10240}
+    };
+    const uint32_t rows = shapes[requested_shape].rows;
+    const uint32_t dim = shapes[requested_shape].dim;
+    const uint32_t hc = shapes[requested_shape].hc;
+    const uint32_t stride = shapes[requested_shape].stride;
+    const uint32_t off = shapes[requested_shape].off;
+    const size_t ni = (size_t)rows * hc * dim, no = (size_t)rows * stride;
+    float *input = malloc(ni * sizeof(float));
+    float *initial = malloc(no * sizeof(float));
+    float *actual = malloc(no * sizeof(float));
+    CHECK(input && initial && actual);
+    for (size_t i = 0; i < ni; i++) input[i] = (float)((int)(i % 97u) - 48) / 32.0f;
+    for (size_t i = 0; i < no; i++) initial[i] = -1234.5f + (float)(i % 11u);
+    ds4_gpu_tensor *in = upload(input, ni * sizeof(float));
+    ds4_gpu_tensor *out = upload(initial, no * sizeof(float));
+    CHECK(in && out);
+    RUN(ds4_gpu_dsv41_hc_mean(rows, dim, hc, in, out, stride, off));
+    CHECK(ds4_gpu_tensor_read(out, 0, actual, no * sizeof(float)));
+    for (uint32_t row = 0; row < rows; row++) for (uint32_t col = 0; col < stride; col++) {
+        const size_t at = (size_t)row * stride + col;
+        if (col < off || col >= off + dim) {
+            CHECK(actual[at] == initial[at]);
+        } else {
+            float expected = 0.0f;
+            for (uint32_t c = 0; c < hc; c++)
+                expected += input[((size_t)row * hc + c) * dim + col - off];
+            expected /= (float)hc;
+            CHECK(actual[at] == expected);
+        }
+    }
+    CHECK(!ds4_gpu_dsv41_hc_mean(rows, dim, hc, in, out, dim, 1));
+    CHECK(!ds4_gpu_dsv41_hc_mean(0, dim, hc, in, out, stride, off));
+    CHECK(!ds4_gpu_dsv41_hc_mean(rows + 1u, dim, hc, in, out, stride, off));
+    ds4_gpu_tensor_free(in); ds4_gpu_tensor_free(out);
+    free(input); free(initial); free(actual);
+    fprintf(stderr, "DSpark HC mean rows=%u dim=%u hc=%u: exact\n", rows, dim, hc);
+    return 1;
+}
+
+static int check_dspark_router(void) {
+    enum { ROWS = 5, EXPERTS = 128, USED = 3 };
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    void *model = NULL;
+    CHECK(!posix_memalign(&model, page, page));
+    memset(model, 0, page);
+    float logits[ROWS * EXPERTS], got_weights[ROWS * USED];
+    int32_t got_ids[ROWS * USED], tokens[ROWS] = {0};
+    for (uint32_t row = 0; row < ROWS; row++) for (uint32_t e = 0; e < EXPERTS; e++)
+        logits[row * EXPERTS + e] =
+            (float)((int)((e * 7919u + row * 1009u) % 104729u) - 52364) / 4096.0f;
+    CHECK(ds4_gpu_set_model_map(model, page));
+    ds4_gpu_tensor *lt = upload(logits, sizeof(logits));
+    ds4_gpu_tensor *pt = upload(NULL, sizeof(logits));
+    ds4_gpu_tensor *it = upload(NULL, sizeof(got_ids));
+    ds4_gpu_tensor *wt = upload(NULL, sizeof(got_weights));
+    ds4_gpu_tensor *tt = upload(tokens, sizeof(tokens));
+    CHECK(lt && pt && it && wt && tt);
+    RUN(ds4_gpu_router_select_batch_tensor(it, wt, pt, model, page,
+        0, 0, 0, 0, 0, false, false, lt, tt,
+        EXPERTS, USED, 1.5f, ROWS));
+    CHECK(ds4_gpu_tensor_read(it, 0, got_ids, sizeof(got_ids)));
+    CHECK(ds4_gpu_tensor_read(wt, 0, got_weights, sizeof(got_weights)));
+    for (uint32_t row = 0; row < ROWS; row++) {
+        candidate sorted[EXPERTS];
+        for (uint32_t e = 0; e < EXPERTS; e++) {
+            const double z = logits[row * EXPERTS + e];
+            const double sp = z > 20 ? z : z < -10 ? exp(z) : log1p(exp(z));
+            sorted[e] = (candidate){(float)sqrt(sp), e};
+        }
+        qsort(sorted, EXPERTS, sizeof(*sorted), candidate_desc);
+        double sum = 0.0;
+        for (uint32_t k = 0; k < USED; k++) {
+            CHECK(got_ids[row * USED + k] == (int32_t)sorted[k].index);
+            sum += sorted[k].score;
+        }
+        for (uint32_t k = 0; k < USED; k++) {
+            const double expected = 1.5 * sorted[k].score / fmax(sum, 0x1p-14);
+            CHECK(fabs(got_weights[row * USED + k] - expected) < 3e-6);
+        }
+    }
+    CHECK(!ds4_gpu_router_select_batch_tensor(it, wt, pt, model, page,
+        0, 0, 0, 0, 0, false, false, lt, tt,
+        127, USED, 1.5f, ROWS));
+    ds4_gpu_tensor_free(lt); ds4_gpu_tensor_free(pt); ds4_gpu_tensor_free(it);
+    ds4_gpu_tensor_free(wt); ds4_gpu_tensor_free(tt);
+    ds4_gpu_cleanup(); free(model);
+    fprintf(stderr, "DSpark router 128 experts/top3: exact selections\n");
+    return ds4_gpu_init();
+}
+
+static float dspark_fixture_weight(const void *model, uint64_t index, int f16) {
+    return f16 ? fixture_half(((const uint16_t *)model)[index]) :
+                 ((const float *)model)[index];
+}
+
+static int check_dspark_markov(void) {
+    const struct {
+        uint32_t block, vocab, rank, dim, parts;
+        int f16;
+    } shapes[] = {
+        {3, 257, 32, 64, 1, 0},
+        {5, 521, 64, 127, 7, 1},
+        {5, 4099, 256, 5120, 64, 1},
+    };
+    const uint32_t block = shapes[requested_shape].block;
+    const uint32_t vocab = shapes[requested_shape].vocab;
+    const uint32_t rank = shapes[requested_shape].rank;
+    const uint32_t dim = shapes[requested_shape].dim;
+    const uint32_t parts = shapes[requested_shape].parts;
+    const int f16 = shapes[requested_shape].f16;
+    const uint64_t weights = (uint64_t)vocab * rank;
+    const uint64_t weight_bytes = weights * (f16 ? 2u : 4u);
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    const uint64_t head_offset = (weight_bytes + page - 1u) & ~(page - 1u);
+    const uint64_t model_bytes = head_offset + weight_bytes;
+    void *model = NULL;
+    CHECK(model_bytes <= SIZE_MAX &&
+          !posix_memalign(&model, (size_t)sysconf(_SC_PAGESIZE), (size_t)model_bytes));
+    memset(model, 0, (size_t)model_bytes);
+    if (f16) {
+        uint16_t *embed = model, *head = (uint16_t *)((char *)model + head_offset);
+        for (uint64_t i = 0; i < weights; i++) {
+            embed[i] = (uint16_t)(0x2000u | ((i * 37u + i / rank * 11u) & 1023u) |
+                                  (i % 5u == 0 ? 0x8000u : 0));
+            head[i] = (uint16_t)(0x2000u | (((i + weights) * 37u + i / rank * 11u) & 1023u) |
+                                 ((i + weights) % 5u == 0 ? 0x8000u : 0));
+        }
+    } else {
+        float *embed = model, *head = (float *)((char *)model + head_offset);
+        for (uint64_t i = 0; i < weights; i++) {
+            embed[i] = (float)((int)((i * 37u + i / rank * 11u) % 257u) - 128) / 1024.0f;
+            head[i] = (float)((int)(((i + weights) * 37u + i / rank * 11u) % 257u) - 128) / 1024.0f;
+        }
+    }
+    float *logits = malloc((size_t)block * vocab * 4);
+    float *x = malloc((size_t)block * dim * 4);
+    float *proj = malloc((size_t)(dim + rank) * 4);
+    float *got_conf = malloc((size_t)block * 4);
+    int32_t *got_tokens = malloc((size_t)(block + 1u) * 4);
+    int32_t *expected_tokens = malloc((size_t)(block + 1u) * 4);
+    CHECK(logits && x && proj && got_conf && got_tokens && expected_tokens);
+    for (uint32_t step = 0; step < block; step++) for (uint32_t v = 0; v < vocab; v++)
+        logits[(size_t)step * vocab + v] =
+            (float)((int)((v * 17u + step * 31u) % 101u) - 50) / 8.0f;
+    for (uint64_t i = 0; i < (uint64_t)block * dim; i++)
+        x[i] = (float)((int)((i * 29u) % 67u) - 33) / 64.0f;
+    for (uint32_t i = 0; i < dim + rank; i++)
+        proj[i] = (float)((int)((i * 43u) % 73u) - 36) / 256.0f;
+    expected_tokens[0] = got_tokens[0] = 3;
+    for (uint32_t i = 1; i <= block; i++) got_tokens[i] = -1;
+    CHECK(ds4_gpu_set_model_map(model, model_bytes));
+    ds4_gpu_tensor *lt = upload(logits, (size_t)block * vocab * 4);
+    ds4_gpu_tensor *xt = upload(x, (size_t)block * dim * 4);
+    ds4_gpu_tensor *pt = upload(proj, (size_t)(dim + rank) * 4);
+    ds4_gpu_tensor *tt = upload(got_tokens, (size_t)(block + 1u) * 4);
+    ds4_gpu_tensor *ct = upload(NULL, (size_t)block * 4);
+    ds4_gpu_tensor *scratch = upload(NULL, (size_t)parts * 2u * 4);
+    ds4_gpu_tensor *head_t = f16 ? upload(NULL, (size_t)weight_bytes) : NULL;
+    CHECK(lt && xt && pt && tt && ct && scratch && (!f16 || head_t));
+    if (f16) RUN(ds4_gpu_dsv41_markov_prepare_head(
+        head_t, model, model_bytes, head_offset, vocab, rank));
+    RUN(ds4_gpu_dsv41_markov_chain(block, vocab, rank, dim, lt, xt,
+        model, model_bytes, 0, head_offset, f16, head_t,
+        pt, tt, ct, scratch, parts));
+    CHECK(ds4_gpu_tensor_read(tt, 0, got_tokens, (size_t)(block + 1u) * 4));
+    CHECK(ds4_gpu_tensor_read(ct, 0, got_conf, (size_t)block * 4));
+    for (uint32_t step = 0; step < block; step++) {
+        const uint32_t prev = (uint32_t)expected_tokens[step];
+        float best = -INFINITY;
+        int32_t best_id = -1;
+        for (uint32_t v = 0; v < vocab; v++) {
+            float score = logits[(size_t)step * vocab + v];
+            for (uint32_t r = 0; r < rank; r++)
+                score = fmaf(dspark_fixture_weight((const char *)model + head_offset,
+                                                   (uint64_t)v * rank + r, f16),
+                             dspark_fixture_weight(model, (uint64_t)prev * rank + r, f16),
+                             score);
+            if (score > best || (score == best && (best_id < 0 || (int32_t)v < best_id))) {
+                best = score; best_id = (int32_t)v;
+            }
+        }
+        expected_tokens[step + 1u] = best_id;
+        CHECK(got_tokens[step + 1u] == best_id);
+        double expected = 0.0, magnitude = 0.0;
+        for (uint32_t d = 0; d < dim; d++) {
+            const double term = (double)proj[d] * x[(size_t)step * dim + d];
+            expected += term; magnitude += fabs(term);
+        }
+        for (uint32_t r = 0; r < rank; r++) {
+            const double term = (double)proj[dim + r] *
+                dspark_fixture_weight(model, (uint64_t)prev * rank + r, f16);
+            expected += term; magnitude += fabs(term);
+        }
+        const double error = fabs((double)got_conf[step] - expected);
+        CHECK(isfinite(got_conf[step]) && error <= 2e-6 * fmax(magnitude, 1.0));
+    }
+    CHECK(!ds4_gpu_dsv41_markov_chain(block, vocab, rank, dim, lt, xt,
+        model, model_bytes - 1u, 0, head_offset, f16, head_t,
+        pt, tt, ct, scratch, parts));
+    CHECK(!ds4_gpu_dsv41_markov_chain(block, vocab, rank, dim, lt, xt,
+        model, model_bytes, 0, head_offset, f16, head_t,
+        pt, tt, ct, scratch, 0));
+    CHECK(!ds4_gpu_dsv41_markov_chain(block + 1u, vocab, rank, dim, lt, xt,
+        model, model_bytes, 0, head_offset, f16, head_t,
+        pt, tt, ct, scratch, parts));
+    if (f16) CHECK(!ds4_gpu_dsv41_markov_prepare_head(
+        head_t, model, model_bytes - 1u, head_offset, vocab, rank));
+    ds4_gpu_tensor_free(lt); ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(pt);
+    ds4_gpu_tensor_free(tt); ds4_gpu_tensor_free(ct); ds4_gpu_tensor_free(scratch);
+    ds4_gpu_tensor_free(head_t);
+    ds4_gpu_cleanup();
+    free(model); free(logits); free(x); free(proj); free(got_conf);
+    free(got_tokens); free(expected_tokens);
+    fprintf(stderr, "DSpark Markov block=%u vocab=%u rank=%u dim=%u f16=%d: token oracle exact\n",
+            block, vocab, rank, dim, f16);
+    return ds4_gpu_init();
+}
+
 static int check_projection(void) {
     const struct { uint32_t width, out, rows; } shapes[] = {
         {1280,4096,1}, {1280,4096,33}, {5120,32,31}, {5120,512,9}, {512,128,513}, {20480,24,33}
@@ -879,6 +1100,9 @@ static const test_case cases[] = {
     {"carry", 16, check_compact_carry},
     {"topk", 14, check_causal_topk},
     {"indexer", 16, check_indexer_scores},
+    {"dspark-hc", 3, check_dspark_hc_mean},
+    {"dspark-router", 1, check_dspark_router},
+    {"dspark-markov", 3, check_dspark_markov},
     {"projection", 6, check_projection},
     {"hc", 4, check_hc_scaled},
     {"attention-output", 6, check_attention_output},

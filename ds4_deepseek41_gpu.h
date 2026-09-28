@@ -78,6 +78,24 @@ int ds4_gpu_dsv41_candidate_filter(ds4_gpu_tensor *scores,
                                   const ds4_gpu_tensor *block_mask,
                                   uint32_t width, uint32_t rows,
                                   uint32_t start, uint32_t ratio);
+/* DSpark feature capture and sequential Markov/confidence head. */
+int ds4_gpu_dsv41_hc_mean(uint32_t rows, uint32_t dim, uint32_t hc,
+                         const ds4_gpu_tensor *stream, ds4_gpu_tensor *out,
+                         uint32_t out_stride, uint32_t out_off);
+int ds4_gpu_dsv41_markov_prepare_head(ds4_gpu_tensor *transposed,
+                                     const void *model_map,
+                                     uint64_t model_size,
+                                     uint64_t head_offset,
+                                     uint32_t vocab, uint32_t rank);
+int ds4_gpu_dsv41_markov_chain(uint32_t block, uint32_t vocab, uint32_t rank,
+                              uint32_t dim, const ds4_gpu_tensor *logits,
+                              const ds4_gpu_tensor *x, const void *model_map,
+                              uint64_t model_size, uint64_t embed_offset,
+                              uint64_t head_offset, int f16,
+                              const ds4_gpu_tensor *transposed_head,
+                              const ds4_gpu_tensor *conf_proj,
+                              ds4_gpu_tensor *tokens, ds4_gpu_tensor *conf,
+                              ds4_gpu_tensor *parts, uint32_t n_parts);
 /* Causal index scores over ratio-1/2 compressed keys, without an extra cast
  * of the already quantized FP4 queries/keys. Scores have source_rows stride. */
 #ifdef DS4_ROCM_BUILD

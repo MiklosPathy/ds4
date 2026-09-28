@@ -261,6 +261,10 @@ static void backend_options(void) {
         }
         assert(!ds4_tp_validate_engine_options(&opt, err, sizeof(err)));
     }
+    ds4_engine_options dspark = valid;
+    dspark.dspark = true;
+    dspark.mtp_path = "draft.gguf";
+    assert(ds4_tp_validate_engine_options(&dspark, err, sizeof(err)));
 }
 
 int main(void) {
