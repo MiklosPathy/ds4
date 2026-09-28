@@ -192,7 +192,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--mtp-exact-sampling", "Preserve the ordinary temperature distribution instead of accepting target-matching greedy drafts directly.");
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
         } else if (tool == DS4_HELP_BENCH) {
-            opt(fp, c, "--dspark", "Benchmark greedy DSpark using the support GGUF passed with --mtp-model.");
+            opt(fp, c, "--dspark", "Enable DSpark speculative decoding using the support GGUF passed with --mtp-model.");
             opt(fp, c, "--dspark-confidence F", "Use a fixed DSpark confidence threshold 0..1 instead of the backend default policy.");
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");

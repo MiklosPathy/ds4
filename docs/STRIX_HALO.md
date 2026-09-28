@@ -56,7 +56,7 @@ SSD-streaming path.
 
 ## DeepSeek V4.1 Flash
 
-- ROCm 10.0 supports published V4.1 Flash Q2 text/vision, resident experts, SSD streaming and [two-machine TCP/RoCE](CLUSTERING_ROCM.md). Engram remains disk-backed.
+- ROCm 10.0 supports published V4.1 Flash Q2 text/vision, resident experts, resident DSpark speculative decoding, SSD streaming and [two-machine TCP/RoCE](CLUSTERING_ROCM.md). Engram remains disk-backed.
 - SSD measurements: 128 GB Framework Desktop, Ryzen AI Max+ 395, Radeon `gfx1151`; SK hynix PC711 1 TB (PCIe 3.0 ×4, ext4) holds the model. Linux `7.2.5-100.fc43.x86_64`, ROCm SDK `10.0.0-4` / HIP `7.15.26333`, TuneD **`accelerator-performance`**.
 
 ### SSD performance
@@ -96,6 +96,21 @@ VISION=gguf/DeepSeek-V4.1-Flash-Vision.gguf
 ```
 
 For sufficient RAM to keep experts resident, omit both SSD options. Keep `--vision` for images and set `--ctx` to the required allocation. See [image requests](MODELS.md#vision).
+
+### Resident DSpark speculative decoding
+
+DSpark requires resident target experts and a separate support GGUF. The qualified support file is the released native-MXFP4 draft at the pinned revision below (7,966,294,016 bytes; SHA256 `7a2217ca6ef27cbce4ac934d8b6f59f2f6158ec288527bbe72b86dcbed95d4b5`):
+
+```bash
+DSPARK=gguf/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf
+curl -L --fail -o "$DSPARK" \
+  https://huggingface.co/kernelpool/DeepSeek-V4.1-Flash-MXFP4-GGUF/resolve/22a073e51781f43e6814885bb4b3cbe540f175ef/DeepSeek-V4.1-Flash-DSpark-MXFP4.gguf
+
+./ds4-server --rocm -m "$MODEL" --mtp-model "$DSPARK" --dspark \
+  --ctx 8192 --host 127.0.0.1 --port 8080
+```
+
+Use normal positive-temperature sampling with `--dspark`; `--mtp-exact-sampling` is a separate diagnostic mode. Set `DS4_DSPARK_STATS=1` to print proposal, acceptance and verifier counters at shutdown. The target contributes about 151.76 GiB of resident tensor spans and the support model about 7.42 GiB, before context and runtime buffers. DSpark is not available with SSD expert streaming.
 
 ### Reproduce SSD measurements
 
