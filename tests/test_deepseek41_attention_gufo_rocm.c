@@ -246,6 +246,8 @@ static int run_case(uint32_t n_tokens, uint32_t n_head, int indexed) {
     fprintf(stderr, "attention case rows=%u heads=%u indexed=%d rmse_vs_control=%.9g max_delta=%.9g max_ref_error=%.9g nonfinite=%zu\n",
             n_tokens, n_head, indexed, rmse, max_delta, max_ref_error, nonfinite);
     CHECK(nonfinite == 0);
+    if (n_tokens < 128u)
+        CHECK(memcmp(control, candidate, q_count * sizeof(*control)) == 0);
     CHECK(max_ref_error < 0.02);
     CHECK(max_delta < 0.04);
 

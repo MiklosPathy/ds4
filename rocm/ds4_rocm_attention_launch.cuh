@@ -388,7 +388,7 @@ static int attention_decode_batch_launch(
     const int fast_window_attention = !g_quality_mode;
     const bool use_gufo =
             ds4_rocm_gfx1151_flag("DS4_ROCM_ATTN_GUFO");
-    if (use_gufo && !use_comp_mask && n_tokens > 1u &&
+    if (use_gufo && !use_comp_mask && n_tokens >= 128u &&
         head_dim == 512u && fast_window_attention &&
         (n_head & 31u) == 0u) {
         dim3 grid(n_tokens, n_head / 32u, 1);
@@ -619,7 +619,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (!g_quality_mode && n_head <= 64u) {
             const bool use_gufo =
                     ds4_rocm_gfx1151_flag("DS4_ROCM_ATTN_GUFO");
-            if (use_gufo && top_k <= DS4_ROCM_GUFO_ATTENTION_WMMA_TOPK_CAP &&
+            if (use_gufo && n_tokens >= 128u &&
+                top_k <= DS4_ROCM_GUFO_ATTENTION_WMMA_TOPK_CAP &&
                 (n_head & 31u) == 0u) {
                 dim3 grid(n_tokens, n_head / 32u, 1);
                 attention_mixed_heads32_gufo_wmma_kernel<true, false><<<grid, 1024>>>(
