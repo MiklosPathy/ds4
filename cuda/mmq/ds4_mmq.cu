@@ -1214,6 +1214,13 @@ struct ds4_mmq_fused_down {
     size_t        input_q8_ext_bytes;
 };
 
+struct ds4_mmq_swiglu_epilogue {
+    const float * router_weights;
+    float       * mid_f32;
+    half        * mid_f16;
+    float         clamp;
+};
+
 static bool ds4_mmq_take_scratch(
         void *base, size_t capacity, size_t *offset,
         size_t bytes, size_t alignment, void **result) {
@@ -1293,12 +1300,13 @@ int ds4_mmq_moe_pair_impl(
         /* ds4 (P3): see ds4_mmq_moe_impl. */
         bool            sanitize_out = true,
         const ds4_mmq_fused_down *fused_down = nullptr,
-        bool allow_d2r = true) {
+        bool allow_d2r = true,
+        const ds4_mmq_swiglu_epilogue *swiglu_epilogue = nullptr) {
 
     const bool direct_gateup_q8 =
         fused_down != nullptr && fused_down->direct_gateup_q8;
     if (!W_a || !W_b || !X_f32 || !ids ||
-        (!direct_gateup_q8 && (!out_a || !out_b))) {
+        (!direct_gateup_q8 && (!out_a || (!out_b && !swiglu_epilogue)))) {
         fprintf(stderr, "%s: null pointer\n", tag);
         return -1;
     }
@@ -1327,6 +1335,12 @@ int ds4_mmq_moe_pair_impl(
            !fused_down->work_scratch || fused_down->work_scratch_bytes == 0)) ||
          !fused_down->out || fused_down->out_dim <= 0 || M % 256 != 0)) {
         fprintf(stderr, "%s: invalid fused Q2_K down configuration\n", tag);
+        return -1;
+    }
+    if (swiglu_epilogue &&
+        (type != GGML_TYPE_IQ2_XXS || fused_down ||
+         !swiglu_epilogue->router_weights || !swiglu_epilogue->mid_f32)) {
+        fprintf(stderr, "%s: invalid weighted SwiGLU epilogue\n", tag);
         return -1;
     }
 
@@ -1485,6 +1499,7 @@ int ds4_mmq_moe_pair_impl(
     const bool use_stream_k =
         (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
+    if (swiglu_epilogue && use_stream_k) return -13;
     /* The fused target-prefill path receives a true top-k assignment: one
      * token cannot select the same expert twice, so no expert bucket can
      * exceed n_tokens rows. Keep the conservative gathered-row bound for all
@@ -1709,7 +1724,7 @@ int ds4_mmq_moe_pair_impl(
     }
 
     bool gate_up_done = false;
-    if (type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr && xb_soa != nullptr &&
+    if (!swiglu_epilogue && type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr && xb_soa != nullptr &&
         allow_d2r && d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0 &&
         ne_get_rows >= d2r_min_cols()) {
         static int d2r_iq2_avail_cc = -1;
@@ -1789,6 +1804,13 @@ int ds4_mmq_moe_pair_impl(
     args.x     = (const char *)W_b;
     args.dst   = out_b;
     args.x_soa = xb_soa;
+    if (swiglu_epilogue) {
+        args.epilogue_gate = out_a;
+        args.epilogue_weights = swiglu_epilogue->router_weights;
+        args.epilogue_mid = swiglu_epilogue->mid_f32;
+        args.epilogue_mid_h = swiglu_epilogue->mid_f16;
+        args.epilogue_clamp = swiglu_epilogue->clamp;
+    }
     {
         ds4_mmq_nvtx_scope stage(
                 "ds4/prefill/moe/iq2_up",
@@ -1926,7 +1948,7 @@ int ds4_mmq_moe_pair_impl(
             }
         }
     }
-    if (sanitize_out) {
+    if (sanitize_out && !swiglu_epilogue) {
         ds4_mmq_sanitize_f32(out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
         ds4_mmq_sanitize_f32(out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
     }
@@ -2005,6 +2027,25 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair(
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
         "ds4_mmq_iq2_xxs_moe_pair", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_iq2_xxs_moe_pair_swiglu(
+        const void * W_gate, const void * W_up,
+        const float * X, const int32_t * ids, const float * router_weights,
+        float * gate, float * discard, float * mid_f32, void * mid_f16,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        float clamp, cudaStream_t stream) {
+    const ds4_mmq_swiglu_epilogue epilogue = {
+        router_weights,
+        mid_f32,
+        (half *)mid_f16,
+        clamp,
+    };
+    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
+        "ds4_mmq_iq2_xxs_moe_pair_swiglu", W_gate, W_up, X, ids,
+        gate, discard, M, K, n_tokens, n_experts, n_expert_used, stream,
+        nullptr, nullptr, 0, /*sanitize_out=*/false, nullptr,
+        /*allow_d2r=*/false, &epilogue);
 }
 
 /* ds4 (P4 Inc3): paired mmq MoE over the aligned-SoA IQ2_XXS gate/up

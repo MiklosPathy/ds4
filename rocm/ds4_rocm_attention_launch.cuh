@@ -386,6 +386,34 @@ static int attention_decode_batch_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     const int fast_window_attention = !g_quality_mode;
+    const bool use_gufo =
+            ds4_rocm_gfx1151_flag("DS4_ROCM_ATTN_GUFO");
+    if (use_gufo && !use_comp_mask && n_tokens > 1u &&
+        head_dim == 512u && fast_window_attention &&
+        (n_head & 31u) == 0u) {
+        dim3 grid(n_tokens, n_head / 32u, 1);
+        attention_mixed_heads32_gufo_wmma_kernel<false, false><<<grid, 1024>>>(
+                (float *)heads->ptr,
+                sinks,
+                (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                NULL,
+                NULL,
+                0u,
+                n_tokens,
+                pos0,
+                n_raw,
+                raw_cap,
+                raw_start,
+                n_comp,
+                0u,
+                window,
+                ratio,
+                n_head,
+                head_dim);
+        return cuda_ok(cudaGetLastError(), "attention ring gufo wmma32 launch");
+    }
     const bool use_wmma_ring =
             ds4_rocm_gfx1151_flag("DS4_ROCM_ATTN_WMMA32_RING");
     if (use_wmma_ring && !use_comp_mask && n_tokens > 1u &&
@@ -589,6 +617,33 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         top_k <= DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         if (!g_quality_mode && n_head <= 64u) {
+            const bool use_gufo =
+                    ds4_rocm_gfx1151_flag("DS4_ROCM_ATTN_GUFO");
+            if (use_gufo && top_k <= DS4_ROCM_GUFO_ATTENTION_WMMA_TOPK_CAP &&
+                (n_head & 31u) == 0u) {
+                dim3 grid(n_tokens, n_head / 32u, 1);
+                attention_mixed_heads32_gufo_wmma_kernel<true, false><<<grid, 1024>>>(
+                        (float *)heads->ptr,
+                        sinks,
+                        (const float *)q->ptr,
+                        (const float *)raw_kv->ptr,
+                        (const float *)comp_kv->ptr,
+                        topk_ptr,
+                        NULL,
+                        0u,
+                        n_tokens,
+                        pos0,
+                        n_raw,
+                        raw_cap,
+                        raw_start,
+                        n_comp,
+                        top_k,
+                        window,
+                        ratio,
+                        n_head,
+                        head_dim);
+                return cuda_ok(cudaGetLastError(), "attention indexed gufo wmma32 launch");
+            }
             const bool use_wmma32 =
                     ds4_rocm_gfx1151_flag("DS4_ROCM_ATTN_WMMA32_INDEXED");
             if (use_wmma32) {
