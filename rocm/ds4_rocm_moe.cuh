@@ -196,14 +196,17 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
     for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * (float)bsum[p];
 }
 
-__device__ static void dev_dot_iq2_xxs_q8_K_block4(
+template<uint32_t N>
+__device__ __forceinline__ static void dev_dot_iq2_xxs_q8_K_block4(
         const cuda_block_iq2_xxs *x,
         const cuda_block_q8_K *y0,
         const cuda_block_q8_K *y1,
         const cuda_block_q8_K *y2,
         const cuda_block_q8_K *y3,
-        uint32_t n,
-        float acc[4]) {
+        float acc[4],
+        const uint64_t *grid,
+        const uint8_t *signs) {
+    static_assert(N >= 1u && N <= 4u);
     const float xd = dev_f16_to_f32(x->d);
     const uint16_t *q2 = x->qs;
     int32_t bsum[4] = {0, 0, 0, 0};
@@ -218,19 +221,39 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block4(
         const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
         q2 += 4;
         const uint32_t ls = 2u * (aux1 >> 28) + 1u;
-        const uint8_t a0 = (uint8_t)(aux0 & 0xffu);
-        const uint8_t a1 = (uint8_t)((aux0 >> 8) & 0xffu);
-        const uint8_t a2 = (uint8_t)((aux0 >> 16) & 0xffu);
-        const uint8_t a3 = (uint8_t)((aux0 >> 24) & 0xffu);
-        for (uint32_t p = 0; p < n; p++) {
+        int32_t w[8];
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),
+                         (aux1 >> 0) & 127u, &w[0], &w[1]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8) & 0xffu),
+                         (aux1 >> 7) & 127u, &w[2], &w[3]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),
+                         (aux1 >> 14) & 127u, &w[4], &w[5]);
+        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),
+                         (aux1 >> 21) & 127u, &w[6], &w[7]);
+        #pragma unroll
+        for (uint32_t p = 0; p < N; p++) {
             int32_t sumi = 0;
-            sumi += dev_dot_iq2_pair_16(a0, (aux1 >> 0) & 127u, a1, (aux1 >> 7) & 127u, q8[p] + ib32 * 32);
-            sumi += dev_dot_iq2_pair_16(a2, (aux1 >> 14) & 127u, a3, (aux1 >> 21) & 127u, q8[p] + ib32 * 32 + 16);
+            const int8_t *q = q8[p] + ib32 * 32;
+            sumi = __dp4a(w[0], *(const int32_t *)(q + 0), sumi);
+            sumi = __dp4a(w[1], *(const int32_t *)(q + 4), sumi);
+            sumi = __dp4a(w[2], *(const int32_t *)(q + 8), sumi);
+            sumi = __dp4a(w[3], *(const int32_t *)(q + 12), sumi);
+            sumi = __dp4a(w[4], *(const int32_t *)(q + 16), sumi);
+            sumi = __dp4a(w[5], *(const int32_t *)(q + 20), sumi);
+            sumi = __dp4a(w[6], *(const int32_t *)(q + 24), sumi);
+            sumi = __dp4a(w[7], *(const int32_t *)(q + 28), sumi);
             bsum[p] += sumi * (int32_t)ls;
         }
     }
     const cuda_block_q8_K *ys[4] = { y0, y1, y2, y3 };
-    for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * (float)bsum[p];
+    #pragma unroll
+    for (uint32_t p = 0; p < N; p++) {
+        /* Preserve the scalar decode path's rounded scale product before the
+         * accumulation FMA.  Gufo found this compiled form while qualifying
+         * its exact verifier tile on gfx1151. */
+        acc[p] = fmaf(__fmul_rn(0.125f * xd, ys[p]->d),
+                      (float)bsum[p], acc[p]);
+    }
 }
 
 __device__ static DS4_ROCM_UNUSED void dev_dot_iq2_xxs_q8_K_block8(
@@ -1327,6 +1350,74 @@ __global__ static void moe_prefix_sorted_pairs_kernel(
     }
 }
 
+/* Build the stable expert buckets and their tile map in one workgroup for a
+ * speculative verifier block.  This is Gufo's narrow-batch construction,
+ * generalized from 256 to the V4.1 target's 384 experts.  Pair order within
+ * each expert remains ascending, so the consuming tile keeps the same
+ * arithmetic order as the multi-launch builder. */
+__global__ static void moe_build_narrow_sorted_tiles_kernel(
+        uint32_t *counts,
+        uint32_t *offsets,
+        uint32_t *sorted_pairs,
+        uint32_t *tile_offsets,
+        uint32_t *tile_total,
+        uint32_t *tile_experts,
+        uint32_t *tile_starts,
+        const int32_t *selected,
+        uint32_t pair_count,
+        uint32_t tile_m,
+        uint32_t bucket_count) {
+    __shared__ uint32_t shared_experts[48];
+    __shared__ uint32_t shared_counts[DS4_ROCM_MAX_N_EXPERT];
+
+    const uint32_t tid = threadIdx.x;
+    for (uint32_t e = tid; e < bucket_count; e += blockDim.x)
+        shared_counts[e] = 0u;
+    if (tid < pair_count) {
+        int32_t expert_i = selected[tid];
+        if (expert_i < 0) expert_i = 0;
+        shared_experts[tid] = (uint32_t)expert_i;
+    }
+    __syncthreads();
+
+    if (tid < pair_count)
+        atomicAdd(&shared_counts[shared_experts[tid]], 1u);
+    __syncthreads();
+
+    for (uint32_t e = tid; e < bucket_count; e += blockDim.x)
+        counts[e] = shared_counts[e];
+    if (tid == 0u) {
+        uint32_t pair_off = 0u;
+        uint32_t tile_off = 0u;
+        for (uint32_t e = 0; e < bucket_count; e++) {
+            offsets[e] = pair_off;
+            pair_off += shared_counts[e];
+            tile_offsets[e] = tile_off;
+            tile_off += (shared_counts[e] + tile_m - 1u) / tile_m;
+        }
+        offsets[bucket_count] = pair_off;
+        tile_offsets[bucket_count] = tile_off;
+        *tile_total = tile_off;
+    }
+    __syncthreads();
+
+    if (tid < pair_count) {
+        const uint32_t expert = shared_experts[tid];
+        uint32_t rank = 0u;
+        for (uint32_t p = 0; p < tid; p++) rank += shared_experts[p] == expert;
+        sorted_pairs[offsets[expert] + rank] = tid;
+    }
+    __syncthreads();
+    for (uint32_t e = tid; e < bucket_count; e += blockDim.x) {
+        const uint32_t first = tile_offsets[e];
+        const uint32_t n = (shared_counts[e] + tile_m - 1u) / tile_m;
+        for (uint32_t t = 0; t < n; t++) {
+            tile_experts[first + t] = e;
+            tile_starts[first + t] = t * tile_m;
+        }
+    }
+}
+
 __global__ static void moe_scatter_sorted_pairs_kernel(
         uint32_t *sorted_pairs,
         uint32_t *cursors,
@@ -1544,13 +1635,21 @@ __global__ static void moe_gate_up_mid_expert_tile4_row32_kernel(
         float clamp) {
     uint32_t tile = blockIdx.y;
     if (tile >= *tile_total) return;
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) {
+        s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    }
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) {
+        s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    }
+    __syncthreads();
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     uint32_t expert = tile_experts[tile];
     uint32_t count = counts[expert];
     if (max_count != 0u && count >= max_count) return;
     uint32_t local_start = tile_starts[tile];
-    __shared__ cuda_block_q8_K sxq[4][16];
     uint32_t pair[4] = {0, 0, 0, 0};
     uint32_t tok[4] = {0, 0, 0, 0};
     uint32_t slot[4] = {0, 0, 0, 0};
@@ -1564,25 +1663,29 @@ __global__ static void moe_gate_up_mid_expert_tile4_row32_kernel(
         slot[np] = pair[np] - tok[np] * n_expert;
         xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
     }
-    if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
-            uint32_t p = i / xq_blocks;
-            uint32_t b = i - p * xq_blocks;
-            sxq[p][b] = xqb[p][b];
-        }
-        __syncthreads();
-        for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
-    }
     if (row >= expert_mid_dim) return;
     const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
     float gate[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float up[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-        dev_dot_iq2_xxs_q8_K_block4(gr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                    xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL, np, gate);
-        dev_dot_iq2_xxs_q8_K_block4(ur + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                    xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL, np, up);
+        const cuda_block_q8_K *y0 = xqb[0] ? xqb[0] + b : NULL;
+        const cuda_block_q8_K *y1 = xqb[1] ? xqb[1] + b : NULL;
+        const cuda_block_q8_K *y2 = xqb[2] ? xqb[2] + b : NULL;
+        const cuda_block_q8_K *y3 = xqb[3] ? xqb[3] + b : NULL;
+        if (np == 1u) {
+            dev_dot_iq2_xxs_q8_K_block4<1u>(gr + b, y0, y1, y2, y3, gate, s_iq2_grid, s_iq2_signs);
+            dev_dot_iq2_xxs_q8_K_block4<1u>(ur + b, y0, y1, y2, y3, up, s_iq2_grid, s_iq2_signs);
+        } else if (np == 2u) {
+            dev_dot_iq2_xxs_q8_K_block4<2u>(gr + b, y0, y1, y2, y3, gate, s_iq2_grid, s_iq2_signs);
+            dev_dot_iq2_xxs_q8_K_block4<2u>(ur + b, y0, y1, y2, y3, up, s_iq2_grid, s_iq2_signs);
+        } else if (np == 3u) {
+            dev_dot_iq2_xxs_q8_K_block4<3u>(gr + b, y0, y1, y2, y3, gate, s_iq2_grid, s_iq2_signs);
+            dev_dot_iq2_xxs_q8_K_block4<3u>(ur + b, y0, y1, y2, y3, up, s_iq2_grid, s_iq2_signs);
+        } else {
+            dev_dot_iq2_xxs_q8_K_block4<4u>(gr + b, y0, y1, y2, y3, gate, s_iq2_grid, s_iq2_signs);
+            dev_dot_iq2_xxs_q8_K_block4<4u>(ur + b, y0, y1, y2, y3, up, s_iq2_grid, s_iq2_signs);
+        }
     }
     for (uint32_t p = 0; p < np; p++) {
         gate[p] = quarter_warp_sum_f32(gate[p], lane);

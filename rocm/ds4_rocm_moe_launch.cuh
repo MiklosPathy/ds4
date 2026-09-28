@@ -10,6 +10,18 @@ static int routed_moe_align256_checked(uint64_t v, uint64_t *out) {
     return 1;
 }
 
+/* Exact worst-case number of nonempty expert tiles. Give every live expert
+ * its first tile, then charge complete tile_m groups beyond those first
+ * assignments. The former ceil(routes/tile_m)+expert_count bound launched
+ * hundreds of empty blocks for a 12--36 route speculative verifier. */
+static uint32_t routed_moe_expert_tile_capacity(
+        uint32_t pair_count,
+        uint32_t tile_m,
+        uint32_t bucket_count) {
+    const uint32_t first = pair_count < bucket_count ? pair_count : bucket_count;
+    return first + (pair_count - first) / tile_m;
+}
+
 enum {
     DS4_ROCM_MOE_DECODE_PROFILE_GATE_RESIDENT_START = 0,
     DS4_ROCM_MOE_DECODE_PROFILE_GATE_RESIDENT_END,
@@ -1018,11 +1030,16 @@ static int routed_moe_launch(
             const uint64_t offsets_bytes = (uint64_t)(bucket_count + 1u) * sizeof(uint32_t);
             const uint64_t cursors_bytes = (uint64_t)bucket_count * sizeof(uint32_t);
             const uint64_t sorted_bytes = (uint64_t)pair_count * sizeof(uint32_t);
-            tile_capacity = (pair_count + expert_tile_m - 1u) / expert_tile_m + bucket_count;
-            tile16_capacity = use_down_tile16 ? ((pair_count + 15u) / 16u + bucket_count) : 0u;
-            tile128_capacity = use_mxfp4_ldsB ? ((pair_count + 127u) / 128u + bucket_count) : 0u;
-            tile32_capacity = use_mxfp4_tile32 ? ((pair_count + 31u) / 32u + bucket_count) : 0u;
-            tile4_capacity = use_mxfp4_tile4 ? ((pair_count + 3u) / 4u + bucket_count) : 0u;
+            tile_capacity = routed_moe_expert_tile_capacity(
+                pair_count, expert_tile_m, bucket_count);
+            tile16_capacity = use_down_tile16 ? routed_moe_expert_tile_capacity(
+                pair_count, 16u, bucket_count) : 0u;
+            tile128_capacity = use_mxfp4_ldsB ? routed_moe_expert_tile_capacity(
+                pair_count, 128u, bucket_count) : 0u;
+            tile32_capacity = use_mxfp4_tile32 ? routed_moe_expert_tile_capacity(
+                pair_count, 32u, bucket_count) : 0u;
+            tile4_capacity = use_mxfp4_tile4 ? routed_moe_expert_tile_capacity(
+                pair_count, 4u, bucket_count) : 0u;
             const uint64_t tile_offsets_bytes = (uint64_t)(bucket_count + 1u) * sizeof(uint32_t);
             const uint64_t tile_total_bytes = sizeof(uint32_t);
             const uint64_t tile_experts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
@@ -1098,8 +1115,23 @@ static int routed_moe_launch(
                 tile4_total = use_mxfp4_tile4 ? (uint32_t *)(scratch + tile4_total_off) : NULL;
                 tile4_experts = use_mxfp4_tile4 ? (uint32_t *)(scratch + tile4_experts_off) : NULL;
                 tile4_starts = use_mxfp4_tile4 ? (uint32_t *)(scratch + tile4_starts_off) : NULL;
-                ok = cuda_ok(cudaMemset(counts, 0, counts_bytes), "routed_moe sorted counts clear");
-                if (ok) {
+                const uint32_t use_narrow_sorted_builder =
+                    g_dspark_verify_mode && iq2_gate_path && use_expert_tiles &&
+                    pair_count <= 48u && !use_down_tile16 &&
+                    !use_mxfp4_ldsB && !use_mxfp4_tile32 && !use_mxfp4_tile4;
+                if (use_narrow_sorted_builder) {
+                    moe_build_narrow_sorted_tiles_kernel<<<1u, 256u>>>(
+                        counts, offsets, sorted_pairs, tile_offsets, tile_total,
+                        tile_experts, tile_starts,
+                        (const int32_t *)selected_exec->ptr,
+                        pair_count, expert_tile_m, bucket_count);
+                    ok = cuda_ok(cudaGetLastError(),
+                                 "routed_moe narrow sorted tiles launch");
+                } else {
+                    ok = cuda_ok(cudaMemset(counts, 0, counts_bytes),
+                                 "routed_moe sorted counts clear");
+                }
+                if (ok && !use_narrow_sorted_builder) {
                     moe_count_sorted_pairs_kernel<<<(pair_count + 255u) / 256u, 256>>>(
                         counts,
                         (const int32_t *)selected_exec->ptr,
@@ -1107,11 +1139,11 @@ static int routed_moe_launch(
                         bucket_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted count launch");
                 }
-                if (ok) {
+                if (ok && !use_narrow_sorted_builder) {
                     moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, bucket_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted prefix launch");
                 }
-                if (ok) {
+                if (ok && !use_narrow_sorted_builder) {
                     moe_scatter_sorted_pairs_deterministic_kernel<<<bucket_count, 1u>>>(
                         sorted_pairs,
                         offsets,
@@ -1120,7 +1152,7 @@ static int routed_moe_launch(
                         bucket_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
                 }
-                if (ok && use_expert_tiles) {
+                if (ok && use_expert_tiles && !use_narrow_sorted_builder) {
                     moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile_offsets, tile_total, counts, expert_tile_m, bucket_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile offsets launch");
                 }
@@ -1151,7 +1183,7 @@ static int routed_moe_launch(
                         tile4_experts, tile4_starts, tile4_offsets, counts, 4u, bucket_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile4 build launch");
                 }
-                if (ok && use_expert_tiles) {
+                if (ok && use_expert_tiles && !use_narrow_sorted_builder) {
                     moe_build_expert_tiles_kernel<<<(bucket_count + 255u) / 256u, 256>>>(
                             tile_experts, tile_starts, tile_offsets, counts, expert_tile_m, bucket_count);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tiles launch");

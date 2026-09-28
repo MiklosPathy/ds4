@@ -3,7 +3,7 @@
 - Two ROCm/gfx1151 machines; tested with 128 GB RAM each.
 - Same engine revision and `DeepSeek-V4.1-Flash-Q2.gguf` on both. Each keeps the full GGUF; each machine loads approximately 80.6 GiB of weights into RAM. Engram stays on disk.
 - Exactly two machines: one coordinator and one worker. They share attention computation and split the experts equally.
-- Cluster mode requires the assigned experts to fit in RAM. SSD expert streaming, DSpark and splitting by `--layers` are not supported.
+- Cluster mode requires the assigned experts to fit in RAM. SSD expert streaming and splitting by `--layers` are not supported. DSpark is supported by loading its support GGUF on both ranks.
 - Both transports require a reachable TCP control address. Use a trusted network: peer traffic has no authentication or encryption.
 - Build both peers with `make strix-halo ROCM_ARCH=gfx1151` after installing any required RoCE headers.
 - Run from the engine build directory. Set these variables in **both** terminals; `MODEL` may differ between machines:
@@ -81,6 +81,25 @@ GID=1                         # Choose this host's nonzero RoCE v2 GID for the c
 
 - RoCE transfers use buffers in system RAM. GPU-direct transfers are not implemented; RCCL is not required.
 - Explicit `tcp` or `rdma` fails if unavailable. `auto` negotiates configured RoCE, then TCP at connection setup; no mid-generation fallback.
+
+## DSpark speculative decoding
+
+Download the pinned native-MXFP4 support GGUF from the [resident setup](STRIX_HALO.md#resident-dspark-speculative-decoding) to both hosts. Add `--mtp-model "$DSPARK" --dspark` to both rank commands. For example, with the RoCE variables above:
+
+```bash
+# Coordinator
+./ds4-server --rocm -m "$MODEL" --mtp-model "$DSPARK" --dspark --ctx "$CTX" \
+  --tensor-parallel --role coordinator --listen "$COORD" 9911 \
+  --transport rdma --rdma-device "$DEV" --rdma-port "$PORT" --rdma-gid-index "$GID" \
+  --host 127.0.0.1 --port 8080
+
+# Worker
+./ds4 --rocm -m "$MODEL" --mtp-model "$DSPARK" --dspark --ctx "$CTX" \
+  --tensor-parallel --role worker --coordinator "$COORD" 9911 \
+  --transport rdma --rdma-device "$DEV" --rdma-port "$PORT" --rdma-gid-index "$GID"
+```
+
+Production sampled DSpark is functionally qualified over TCP and RoCE. In the retained 7,642-prompt-token plus 256-output-token RoCE coding run it measured 15.76 tok/s versus 16.25 tok/s target-only, so it is not a distributed speed recommendation.
 
 ## Vision and first request
 

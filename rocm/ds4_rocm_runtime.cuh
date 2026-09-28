@@ -38,6 +38,7 @@ static bool g_deepseek41_model;
 static int g_glm_model;
 
 enum {
+    DS4_ROCM_DSPARK_N_EXPERT = 128u,
     DS4_ROCM_N_EXPERT = 256u,
     DS4_ROCM_GLM53_N_EXPERT = 288u,
     DS4_ROCM_MAX_N_EXPERT = 384u,

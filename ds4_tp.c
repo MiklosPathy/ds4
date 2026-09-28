@@ -754,10 +754,13 @@ int ds4_tp_validate_engine_options(
         return 0;
     }
 #ifdef DS4_TP_LINUX
+    const bool external_dspark = opt->dspark && opt->mtp_path && opt->mtp_path[0];
+    const bool incomplete_support =
+        (opt->dspark || (opt->mtp_path && opt->mtp_path[0])) && !external_dspark;
     if (opt->backend == DS4_BACKEND_CUDA &&
-        (opt->ssd_streaming || opt->dspark || opt->glm_mtp ||
-         (opt->mtp_path && opt->mtp_path[0]) || opt->cuda_tensor_parallel)) {
-        tp_set_err(err, errlen, "V4.1 ROCm network TP requires resident weights without speculative drafting or local multi-GPU TP");
+        (opt->ssd_streaming || opt->glm_mtp || incomplete_support ||
+         opt->cuda_tensor_parallel)) {
+        tp_set_err(err, errlen, "V4.1 ROCm network TP requires resident weights; DSpark requires --dspark with --mtp-model, and local multi-GPU TP is unavailable");
         return 0;
     }
     if (opt->tp.world == 3 && opt->backend != DS4_BACKEND_CUDA) {
