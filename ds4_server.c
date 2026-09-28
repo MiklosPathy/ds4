@@ -16047,6 +16047,10 @@ static server_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.prefill_chunk = (uint32_t)v;
+        } else if (!strcmp(arg, "--rocm-host-reserve-mib")) {
+            int v = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.engine.rocm_host_reserve_bytes = (uint64_t)v << 20;
+            c.engine.rocm_host_reserve_set = true;
         } else if (!strcmp(arg, "--power")) {
             c.engine.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {

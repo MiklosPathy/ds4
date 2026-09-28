@@ -154,6 +154,9 @@ typedef struct {
     uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
+    /* ROCm V4.1: replaces the default max(8 GiB, RAM/16) OS memory reserve. */
+    uint64_t rocm_host_reserve_bytes;
+    bool rocm_host_reserve_set;
     bool warm_weights;
     bool quality;
     bool glm_mtp;

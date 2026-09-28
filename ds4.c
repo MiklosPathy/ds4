@@ -42950,6 +42950,8 @@ struct ds4_engine {
     uint64_t ds41_session_bytes;
 #ifdef DS4_ROCM_BUILD
     uint64_t ds41_host_memory_baseline;
+    uint64_t ds41_host_reserve_override;
+    bool ds41_host_reserve_set;
     bool ds41_model_loaded, ds41_stream_slots_ready;
 #endif
     ds4_model model;
@@ -71196,21 +71198,23 @@ static bool engine_warm_full_model(const ds4_engine_options *opt) {
 
 #ifdef DS4_HAS_DEEPSEEK41_GPU
 #ifdef DS4_ROCM_BUILD
-static uint64_t ds41_rocm_host_reserve_bytes(uint64_t host) {
+static uint64_t ds41_rocm_host_reserve_bytes(const ds4_engine *e, uint64_t host) {
     /* Match the ROCm resident GLM policy: usable host RAM already excludes CMA.
      * The one-eighth reserve rejects viable resident vision sessions and
      * limits SSD cache capacity despite usable host memory. Keep an
-     * explicit OS reserve and the separate two-GiB runtime allowance. */
+     * explicit OS reserve and the separate two-GiB runtime allowance.
+     * --rocm-host-reserve-mib replaces only the OS reserve. */
+    if (e->ds41_host_reserve_set) return e->ds41_host_reserve_override;
     const uint64_t minimum = UINT64_C(8) << 30;
     const uint64_t reserve = host / 16u;
     return reserve > minimum ? reserve : minimum;
 }
 
-static uint64_t ds41_rocm_stream_reserve_bytes(uint64_t host) {
+static uint64_t ds41_rocm_stream_reserve_bytes(const ds4_engine *e, uint64_t host) {
     /* Graphs and staging have their own admission charges. Keep the same OS
      * reserve plus the entire transient allowance during lazy cache growth;
      * the generic 16-GiB allocator floor otherwise strands admitted slots. */
-    return ds4_add_sat_u64(ds41_rocm_host_reserve_bytes(host), UINT64_C(2) << 30);
+    return ds4_add_sat_u64(ds41_rocm_host_reserve_bytes(e, host), UINT64_C(2) << 30);
 }
 #endif
 static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
@@ -71220,7 +71224,7 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
     uint64_t budget = host / 8u * 7u;
 #ifdef DS4_ROCM_BUILD
     {
-        const uint64_t reserve = ds41_rocm_host_reserve_bytes(host);
+        const uint64_t reserve = ds41_rocm_host_reserve_bytes(e, host);
         budget = host > reserve ? host - reserve : 0;
     }
 #endif
@@ -71335,7 +71339,7 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
     if (e->vision_ready && !e->vision_map_ready)
         not_loaded = ds4_add_sat_u64(not_loaded, e->vision_model.size);
     const uint64_t required = ds4_add_sat_u64(not_loaded, ds4_add_sat_u64(additional,
-        ds4_add_sat_u64(ds41_rocm_host_reserve_bytes(e->ds41_host_memory_baseline), remaining_buffers)));
+        ds4_add_sat_u64(ds41_rocm_host_reserve_bytes(e, e->ds41_host_memory_baseline), remaining_buffers)));
     if (required >= available) {
         fprintf(stderr, "ds4: V4.1 ROCm needs %.2f GiB additional usable memory including reserves; "
                         "only %.2f GiB is available\n", ds4_bytes_to_gib(required),
@@ -71392,6 +71396,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->ssd_streaming_full_layers_set = opt->ssd_streaming_full_layers_set;
     e->distributed = opt->distributed;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
+#ifdef DS4_ROCM_BUILD
+    e->ds41_host_reserve_set = opt->rocm_host_reserve_set;
+    e->ds41_host_reserve_override = opt->rocm_host_reserve_bytes;
+    if (e->ds41_host_reserve_set)
+        fprintf(stderr, "ds4: V4.1 ROCm OS memory reserve set to %.2f GiB (--rocm-host-reserve-mib)\n",
+                ds4_bytes_to_gib(e->ds41_host_reserve_override));
+#endif
     if (opt->vision_path && opt->vision_path[0]) {
         if (opt->backend != DS4_BACKEND_METAL &&
             opt->backend != DS4_BACKEND_CUDA) {
@@ -72277,7 +72288,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #ifdef DS4_ROCM_BUILD
         ds4_gpu_set_deepseek41_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && e->ssd_streaming) {
-            const uint64_t reserve = ds41_rocm_stream_reserve_bytes(e->ds41_host_memory_baseline);
+            const uint64_t reserve = ds41_rocm_stream_reserve_bytes(e, e->ds41_host_memory_baseline);
             ds4_gpu_set_streaming_free_reserve(reserve);
             fprintf(stderr, "ds4: V4.1 ROCm SSD allocator reserve %.2f GiB (OS + transients)\n",
                     ds4_bytes_to_gib(reserve));
