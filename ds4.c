@@ -43355,8 +43355,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #ifdef DS4_ROCM_BUILD
         const bool batch_attention = prefill_only;
         const bool batch_output = g->draft && g->draft->verify_rows == rows &&
-            rows > 1u &&
-            g->tp_world == 1u &&
+            rows > 1u && rows <= DS4_DSPARK_MAX_BLOCK_SIZE + 1u &&
             l->attn_output_a->type == DS4_TENSOR_Q8_0 &&
             l->attn_output_b->type == DS4_TENSOR_Q8_0 &&
             !getenv("DS4_ROCM_DSPARK_V41_DISABLE_BATCH_ATTN_OUT");
@@ -43379,7 +43378,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         }
 #ifdef DS4_ROCM_BUILD
         if (ok && batch_output)
-            ok = ds4_gpu_dsv41_attention_output_batch(active.block, active.low,
+            ok = g->tp_world == 2u ?
+                ds4_gpu_dsv41_attention_output_tp_batch(active.block, active.low,
+                    model->map, model->size,
+                    l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
+                    active.heads, rows, g->tp_rank) :
+                ds4_gpu_dsv41_attention_output_batch(active.block, active.low,
                     model->map, model->size,
                     l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
                     active.heads, rows);

@@ -1029,8 +1029,11 @@ __global__ static void v41_q8_f32_blocks4_kernel(float *out,
         const unsigned char *weights, const float *input,
         uint32_t width, uint32_t outputs, uint64_t row_bytes) {
     const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t token = blockIdx.y;
     const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     if (row >= outputs) return;
+    input += (uint64_t)token * width;
+    out += (uint64_t)token * outputs;
     const uint32_t blocks = width / 32u;
     float acc = 0.0f;
     for (uint32_t b = lane / 8u; b < blocks; b += 4u) {
@@ -1276,7 +1279,9 @@ __global__ static void v41_grouped_q8_f32_blocks4_kernel(
         float *out, const unsigned char *w, const float *x, int K, int M, int G) {
     int lane = threadIdx.x & 31, row = blockIdx.x * 8 + threadIdx.x / 32;
     if (row >= M * G) return;
-    const float *in = x + (row / M) * K;
+    const uint32_t token = blockIdx.y;
+    const float *in = x + ((size_t)token * G + row / M) * K;
+    out += (size_t)token * M * G;
     float acc = 0;
     for (int b = lane / 8; b < K / 32; b += 4) {
         const unsigned char *p = w + ((size_t) row * (K / 32) + b) * 34;
@@ -1373,8 +1378,8 @@ extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(ds4_gpu_tensor *out, ds4_
         out_b_offset, b_bytes, "V4.1 TP attn_out_b");
     if (!a || !b) return 0;
     b += (uint64_t)tp_rank * 128u * 34u;
-    if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
-        v41_grouped_q8_f32_blocks4_kernel<<<512u, 256u>>>(
+    if (n_tokens <= 6u && ds4_rocm_is_gfx1151()) {
+        v41_grouped_q8_f32_blocks4_kernel<<<dim3(512u, n_tokens), 256u>>>(
             (float *)low->ptr, a, (const float *)heads->ptr, 4096, 1024, 4);
     } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
         v41_grouped_q8_f32_wmma_rowtile_kernel<128u, 8u, 4u><<<dim3(8u, (n_tokens + 63u) / 64u, 4u), 256u>>>(
@@ -1390,8 +1395,8 @@ extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(ds4_gpu_tensor *out, ds4_
     }
     if (!cuda_ok(cudaGetLastError(), "V4.1 TP attention low projection") ||
         !ds4_gpu_dsv41_quantize(low, 4096u, n_tokens, DS4_V41_BF16)) return 0;
-    if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
-        v41_q8_f32_blocks4_kernel<<<640u, 256u>>>(
+    if (n_tokens <= 6u && ds4_rocm_is_gfx1151()) {
+        v41_q8_f32_blocks4_kernel<<<dim3(640u, n_tokens), 256u>>>(
             (float *)out->ptr, b, (const float *)low->ptr,
             4096u, 5120u, UINT64_C(256) * 34u);
     } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {

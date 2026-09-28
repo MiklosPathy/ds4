@@ -94,10 +94,13 @@ static int run(unsigned n,unsigned rank,int cast_fixture) {
     for(unsigned g=0;g<8;++g)weights(model+(size_t)g*R*(K/32),R,K,g*R);
     weights((q8_block*)((char*)model+ab),M,8192,0);
     size_t nx=(size_t)n*G*K,nl=(size_t)n*G*R,ny=(size_t)n*M;
-    float *x=malloc(nx*4),*low=malloc(nl*4),*out=malloc(ny*4),*ref=malloc(4096*4);CHECK(x&&low&&out&&ref);
+    float *x=malloc(nx*4),*low=malloc(nl*4),*out=malloc(ny*4),*ref=malloc(4096*4);
+    float *scalar_low=malloc(nl*4),*scalar_out=malloc(ny*4);
+    CHECK(x&&low&&out&&ref&&scalar_low&&scalar_out);
     for(size_t i=0;i<nx;++i)x[i]=cast_fixture?((i&1)?-1:1)*(1.00390625f+0.00001f):((int)((i*37+rank*19)%257)-128)/32.f;
     CHECK(ds4_gpu_set_model_map(model,wb));
-    ds4_gpu_tensor *xt=upload(x,nx*4),*lt=upload(NULL,nl*4),*yt=upload(NULL,ny*4);CHECK(xt&&lt&&yt);
+    ds4_gpu_tensor *xt=upload(x,nx*4),*lt=upload(NULL,nl*4),*yt=upload(NULL,ny*4);
+    ds4_gpu_tensor *slt=upload(NULL,nl*4),*syt=upload(NULL,ny*4);CHECK(xt&&lt&&yt&&slt&&syt);
     /* Register the full baseline range before the owned subrange, avoiding
      * an overlapping expansion in the existing lazy model-map cache. */
     float *fx=calloc((size_t)n*32768,4),*fl=malloc((size_t)n*8192*4);CHECK(fx&&fl);
@@ -107,6 +110,17 @@ static int run(unsigned n,unsigned rank,int cast_fixture) {
     CHECK(ds4_gpu_tensor_read(flt,0,fl,(size_t)n*8192*4));
     RUN(ds4_gpu_dsv41_attention_output_tp_batch(yt,lt,model,wb,0,ab,xt,n,rank));
     CHECK(ds4_gpu_tensor_read(lt,0,low,nl*4));CHECK(ds4_gpu_tensor_read(yt,0,out,ny*4));
+    for(unsigned t=0;t<n;++t) {
+        ds4_gpu_tensor *xrow=ds4_gpu_tensor_view(xt,(size_t)t*G*K*4,(size_t)G*K*4);
+        ds4_gpu_tensor *lrow=ds4_gpu_tensor_view(slt,(size_t)t*G*R*4,(size_t)G*R*4);
+        ds4_gpu_tensor *yrow=ds4_gpu_tensor_view(syt,(size_t)t*M*4,(size_t)M*4);
+        CHECK(xrow&&lrow&&yrow);
+        RUN(ds4_gpu_dsv41_attention_output_tp_batch(yrow,lrow,model,wb,0,ab,xrow,1,rank));
+        ds4_gpu_tensor_free(yrow);ds4_gpu_tensor_free(lrow);ds4_gpu_tensor_free(xrow);
+    }
+    CHECK(ds4_gpu_tensor_read(slt,0,scalar_low,nl*4));
+    CHECK(ds4_gpu_tensor_read(syt,0,scalar_out,ny*4));
+    CHECK(!memcmp(low,scalar_low,nl*4));CHECK(!memcmp(out,scalar_out,ny*4));
     size_t bad_low=0,bad_out=0,outside_low_interval=0;double max_error=0;
     for(unsigned t=0;t<n;++t) {
         for(unsigned g=0;g<G;++g)for(unsigned r=0;r<R;++r) {
@@ -153,8 +167,9 @@ static int run(unsigned n,unsigned rank,int cast_fixture) {
     CHECK(!ds4_gpu_dsv41_attention_output_tp_batch(yt,lt,model,wb,0,ab,xt,n,2));
     CHECK(!ds4_gpu_dsv41_attention_output_tp_batch(yt,lt,model,wb-1,0,ab,xt,n,rank));
     CHECK(!ds4_gpu_dsv41_attention_output_tp_batch(yt,lt,model,wb,0,ab,xt,n+1,rank));
-    CHECK(sync_guards());ds4_gpu_tensor_free(yt);ds4_gpu_tensor_free(lt);ds4_gpu_tensor_free(xt);
-    ds4_gpu_cleanup();free(model);free(x);free(low);free(out);free(ref);return 1;
+    CHECK(sync_guards());ds4_gpu_tensor_free(syt);ds4_gpu_tensor_free(slt);
+    ds4_gpu_tensor_free(yt);ds4_gpu_tensor_free(lt);ds4_gpu_tensor_free(xt);
+    ds4_gpu_cleanup();free(model);free(x);free(low);free(out);free(ref);free(scalar_low);free(scalar_out);return 1;
 }
 int main(int argc,char **argv) {
     if(argc!=4)return 2;
