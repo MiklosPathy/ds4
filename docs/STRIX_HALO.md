@@ -97,6 +97,14 @@ VISION=gguf/DeepSeek-V4.1-Flash-Vision.gguf
 
 For sufficient RAM to keep experts resident, omit both SSD options. Keep `--vision` for images and set `--ctx` to the required allocation. See [image requests](MODELS.md#vision).
 
+### Host memory reserve
+
+V4.1 on ROCm admits weights, context and caches only if an OS reserve of host RAM stays free: `max(8 GiB, RAM/16)` (8 GiB on 128 GB systems), plus a separate 2 GiB runtime allowance. A context that does not fit fails at startup with `ds4: V4.1 ROCm needs X GiB additional usable memory including reserves; only Y GiB is available`.
+
+`--rocm-host-reserve-mib N` (`ds4` and `ds4-server`) replaces only the OS reserve; the 2 GiB allowance remains. In a tensor-parallel cluster pass the same value on every rank. Startup prints `V4.1 ROCm OS memory reserve set to …` when the override is active.
+
+Measured on three 128 GB nodes, Q4 with `--vision`, tensor-parallel: `--ctx 450000` failed with the default reserve (needs 16.03 GiB, 15.91 GiB available) and started with `--rocm-host-reserve-mib 4096` on all ranks. The lowest `MemAvailable` during a 37K-token prefill was about 9.1 GiB. Lower the reserve only as far as needed and watch `MemAvailable` under real load; too small a reserve risks the OOM killer or a hung host.
+
 ### Resident DSpark speculative decoding
 
 DSpark requires resident target experts and a separate support GGUF. The qualified support file is the released native-MXFP4 draft at the pinned revision below (7,966,294,016 bytes; SHA256 `7a2217ca6ef27cbce4ac934d8b6f59f2f6158ec288527bbe72b86dcbed95d4b5`):
