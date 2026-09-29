@@ -842,6 +842,65 @@ __global__ static void f16_ordered_token_reuse(
     }
 }
 
+/* Batch the V4.1 F32-input F16 projections without changing their arithmetic.
+ * Each wave still owns one output row; every token keeps the production
+ * shared-X kernel's strided FMA sequence and warp reduction. The only change
+ * is reusing each decoded F16 weight across TT independent token accumulators. */
+template<unsigned TT, unsigned WAVES, unsigned SEG>
+__global__ static void v41_f16_sharedx_token_reuse(
+        float *out, const __half *weight, const float *input,
+        uint32_t in_dim, uint32_t out_dim, uint32_t rows) {
+    extern __shared__ float tile[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t row = blockIdx.x * WAVES + wave;
+    const uint32_t token0 = blockIdx.y * TT;
+    float acc[TT] = {};
+    const __half *wr = row < out_dim ? weight + (uint64_t)row * in_dim : NULL;
+
+    for (uint32_t base = 0; base < in_dim; base += SEG) {
+        const uint32_t remaining = in_dim - base;
+        const uint32_t valid = remaining < SEG ? remaining : SEG;
+        for (uint32_t j = tid; j < TT * SEG; j += WAVES * 32u) {
+            const uint32_t token = j / SEG;
+            const uint32_t offset = j - token * SEG;
+            tile[j] = token0 + token < rows && offset < valid ?
+                input[(uint64_t)(token0 + token) * in_dim + base + offset] : 0.0f;
+        }
+        __syncthreads();
+        if (row < out_dim) {
+            for (uint32_t offset = lane; offset < valid; offset += 32u) {
+                const float w = __half2float(wr[base + offset]);
+#pragma unroll
+                for (uint32_t token = 0; token < TT; token++) {
+                    if (token0 + token < rows)
+                        acc[token] += w * tile[token * SEG + offset];
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t token = 0; token < TT; token++) {
+        const float total = warp_sum_f32(acc[token]);
+        if (row < out_dim && token0 + token < rows && lane == 0u)
+            out[(uint64_t)(token0 + token) * out_dim + row] = total;
+    }
+}
+
+template<unsigned TT, unsigned SEG>
+static void v41_launch_f16_sharedx_token_reuse(
+        float *out, const __half *weight, const float *input,
+        uint32_t in_dim, uint32_t out_dim, uint32_t rows) {
+    const uint32_t waves = 16u;
+    const dim3 grid((out_dim + waves - 1u) / waves,
+                    (rows + TT - 1u) / TT, 1u);
+    v41_f16_sharedx_token_reuse<TT, 16u, SEG>
+        <<<grid, waves * 32u, TT * SEG * sizeof(float)>>>(
+            out, weight, input, in_dim, out_dim, rows);
+}
+
 __global__ static void v41_hc_half_to_float(float *out, const __half *weight, uint64_t count) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) out[i] = __half2float(weight[i]);
@@ -1034,6 +1093,21 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
                 (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
         }
         return cuda_ok(cudaGetLastError(), "V4.1 F32-input HC projection");
+    }
+    if (rows >= 32u && ds4_rocm_is_gfx1151()) {
+        const __half *w = (const __half *)cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes, "V4.1 F32-input F16 projection");
+        if (!w) return 0;
+        if (width == 5120u && outputs == 512u) {
+            v41_launch_f16_sharedx_token_reuse<4u, 128u>(
+                (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
+            return cuda_ok(cudaGetLastError(), "V4.1 F16 512 token-reuse projection");
+        }
+        if (width == 5120u && outputs == 32u) {
+            v41_launch_f16_sharedx_token_reuse<4u, 512u>(
+                (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
+            return cuda_ok(cudaGetLastError(), "V4.1 F16 32 token-reuse projection");
+        }
     }
     /* The general batched F16 API casts inputs to F16. Row views preserve decode arithmetic and retain F32 activations. */
     for (uint32_t row = 0; row < rows; row++) {

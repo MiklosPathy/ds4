@@ -803,7 +803,9 @@ static int check_dspark_markov(void) {
 static int check_projection(void) {
     const struct { uint32_t width, out, rows; } shapes[] = {
         {1280,4096,1}, {1280,4096,33}, {5120,32,31}, {5120,512,9}, {512,128,513}, {20480,24,33},
-        {6144,25600,2}, {6144,25600,3}, {6144,25600,4}, {6144,25600,5}, {6144,25600,6}
+        {6144,25600,2}, {6144,25600,3}, {6144,25600,4}, {6144,25600,5}, {6144,25600,6},
+        {5120,32,32}, {5120,32,33}, {5120,32,127}, {5120,32,128}, {5120,32,129},
+        {5120,512,32}, {5120,512,33}, {5120,512,127}, {5120,512,128}, {5120,512,129}
     };
     const uint32_t width = shapes[requested_shape].width, output = shapes[requested_shape].out, rows = shapes[requested_shape].rows;
     const size_t weight_bytes = (size_t)width * output * 2, nx = (size_t)width * rows, ny = (size_t)output * rows;
@@ -1183,7 +1185,7 @@ static const test_case cases[] = {
     {"dspark-hc", 3, check_dspark_hc_mean},
     {"dspark-router", 1, check_dspark_router},
     {"dspark-markov", 3, check_dspark_markov},
-    {"projection", 11, check_projection},
+    {"projection", 21, check_projection},
     {"hc", 4, check_hc_scaled},
     {"q8-prefill-projection", 28, check_q8_prefill_projection},
     {"attention-output", 6, check_attention_output},
