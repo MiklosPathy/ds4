@@ -156,6 +156,12 @@ int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
                            uint32_t selected_rows);
 
 #if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+/* Tiny F32 projections preserving individual scalar matvec reductions. */
+int ds4_gpu_dsv41_f32_projection_rows(ds4_gpu_tensor *out,
+                                     const void *model_map, uint64_t model_size,
+                                     uint64_t weight_offset, uint32_t width,
+                                     uint32_t outputs, uint32_t rows,
+                                     const ds4_gpu_tensor *in);
 /* V4.1 IQ2_XXS/Q2_K resident rank reference: global routing IDs, one
  * contiguous half of384 experts, and F32 partial output. */
 int ds4_gpu_dsv41_routed_moe_tp_tensor(

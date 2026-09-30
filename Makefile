@@ -901,6 +901,12 @@ tests/test_deepseek41_tp3_rocm.o: tests/test_deepseek41_tp3_rocm.c ds4_gpu.h ds4
 ds4-kernel-v41-tp3: tests/test_deepseek41_tp3_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
+tests/test_deepseek41_attention_gufo_rocm.o: tests/test_deepseek41_attention_gufo_rocm.c ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -ffp-contract=off $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+ds4-kernel-v41-attention-gufo: tests/test_deepseek41_attention_gufo_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
 ds4-kernel-v41: tests/test_deepseek41_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
@@ -1205,7 +1211,7 @@ clean:
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
 	rm -f tests/test_ssd_cache tests/test_engram
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands tests/test_tp_linux tests/test_tp3_mesh
-	rm -f ds4-kernel-v41-tp3 ds4-kernel-v41-tp-bind-failure ds4-kernel-v41-tp-attention ds4-kernel-v41-tp-moe ds4-kernel-v41-tp-gates ds4-kernel-v41-tp-mmq ds4-kernel-v41-tp-down
+	rm -f ds4-kernel-v41-tp3 ds4-kernel-v41-tp-bind-failure ds4-kernel-v41-tp-attention ds4-kernel-v41-attention-gufo ds4-kernel-v41-tp-moe ds4-kernel-v41-tp-gates ds4-kernel-v41-tp-mmq ds4-kernel-v41-tp-down
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp
 	rm -f tests/test_metal_tp_spec
 	rm -f tests/test_metal_tp_cancel

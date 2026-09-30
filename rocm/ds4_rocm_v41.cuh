@@ -842,6 +842,65 @@ __global__ static void f16_ordered_token_reuse(
     }
 }
 
+/* Batch the V4.1 F32-input F16 projections without changing their arithmetic.
+ * Each wave still owns one output row; every token keeps the production
+ * shared-X kernel's strided FMA sequence and warp reduction. The only change
+ * is reusing each decoded F16 weight across TT independent token accumulators. */
+template<unsigned TT, unsigned WAVES, unsigned SEG>
+__global__ static void v41_f16_sharedx_token_reuse(
+        float *out, const __half *weight, const float *input,
+        uint32_t in_dim, uint32_t out_dim, uint32_t rows) {
+    extern __shared__ float tile[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t row = blockIdx.x * WAVES + wave;
+    const uint32_t token0 = blockIdx.y * TT;
+    float acc[TT] = {};
+    const __half *wr = row < out_dim ? weight + (uint64_t)row * in_dim : NULL;
+
+    for (uint32_t base = 0; base < in_dim; base += SEG) {
+        const uint32_t remaining = in_dim - base;
+        const uint32_t valid = remaining < SEG ? remaining : SEG;
+        for (uint32_t j = tid; j < TT * SEG; j += WAVES * 32u) {
+            const uint32_t token = j / SEG;
+            const uint32_t offset = j - token * SEG;
+            tile[j] = token0 + token < rows && offset < valid ?
+                input[(uint64_t)(token0 + token) * in_dim + base + offset] : 0.0f;
+        }
+        __syncthreads();
+        if (row < out_dim) {
+            for (uint32_t offset = lane; offset < valid; offset += 32u) {
+                const float w = __half2float(wr[base + offset]);
+#pragma unroll
+                for (uint32_t token = 0; token < TT; token++) {
+                    if (token0 + token < rows)
+                        acc[token] += w * tile[token * SEG + offset];
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t token = 0; token < TT; token++) {
+        const float total = warp_sum_f32(acc[token]);
+        if (row < out_dim && token0 + token < rows && lane == 0u)
+            out[(uint64_t)(token0 + token) * out_dim + row] = total;
+    }
+}
+
+template<unsigned TT, unsigned SEG>
+static void v41_launch_f16_sharedx_token_reuse(
+        float *out, const __half *weight, const float *input,
+        uint32_t in_dim, uint32_t out_dim, uint32_t rows) {
+    const uint32_t waves = 16u;
+    const dim3 grid((out_dim + waves - 1u) / waves,
+                    (rows + TT - 1u) / TT, 1u);
+    v41_f16_sharedx_token_reuse<TT, 16u, SEG>
+        <<<grid, waves * 32u, TT * SEG * sizeof(float)>>>(
+            out, weight, input, in_dim, out_dim, rows);
+}
+
 __global__ static void v41_hc_half_to_float(float *out, const __half *weight, uint64_t count) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) out[i] = __half2float(weight[i]);
@@ -955,6 +1014,37 @@ static cuda_hipblaslt_gemm_plan *v41_engram_lt_plan(uint32_t rows) {
         "V4.1 Engram F16/F32", HIP_R_32F, 2539);
 }
 
+/* Tiny HC projection: prefetch aligned pairs without changing the scalar
+ * 640-element lane accumulation or the ordered sum of 32 lane partials. */
+__global__ static void v41_hc_ordered_prefetch_kernel(float *out,
+        const __half *weights, const float *input) {
+    constexpr unsigned width = 20480u, outputs = 24u, chunk = 640u;
+    const unsigned lane = threadIdx.x, row = blockIdx.x, token = blockIdx.y;
+    const __half *w = weights + (uint64_t)row * width;
+    const float *x = input + (uint64_t)token * width;
+    __shared__ float partial[32];
+    float sum = 0.0f;
+    for (unsigned base = lane * chunk; base < (lane + 1u) * chunk; base += 16u) {
+        float ww[16], xx[16];
+#pragma unroll
+        for (unsigned u = 0; u < 16u; u += 2u) {
+            const float2 wp = __half22float2(*reinterpret_cast<const __half2 *>(w + base + u));
+            const float2 xp = *reinterpret_cast<const float2 *>(x + base + u);
+            ww[u] = wp.x; ww[u + 1u] = wp.y;
+            xx[u] = xp.x; xx[u + 1u] = xp.y;
+        }
+#pragma unroll
+        for (unsigned u = 0; u < 16u; u++) sum = __fmaf_rn(ww[u], xx[u], sum);
+    }
+    partial[lane] = sum;
+    __syncthreads();
+    if (lane == 0u) {
+        float total = 0.0f;
+        for (unsigned i = 0; i < 32u; i++) total += partial[i];
+        out[(uint64_t)token * outputs + row] = total;
+    }
+}
+
 extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                              uint64_t weight_offset, uint32_t width, uint32_t outputs,
                                              uint32_t rows, const ds4_gpu_tensor *in) {
@@ -1035,6 +1125,38 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
         }
         return cuda_ok(cudaGetLastError(), "V4.1 F32-input HC projection");
     }
+    if (rows >= 32u && ds4_rocm_is_gfx1151()) {
+        const __half *w = (const __half *)cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes, "V4.1 F32-input F16 projection");
+        if (!w) return 0;
+        if (width == 5120u && outputs == 512u) {
+            v41_launch_f16_sharedx_token_reuse<4u, 128u>(
+                (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
+            return cuda_ok(cudaGetLastError(), "V4.1 F16 512 token-reuse projection");
+        }
+        if (width == 5120u && outputs == 32u) {
+            v41_launch_f16_sharedx_token_reuse<4u, 512u>(
+                (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
+            return cuda_ok(cudaGetLastError(), "V4.1 F16 32 token-reuse projection");
+        }
+    }
+    if (width == 20480u && outputs == 24u && rows <= 6u &&
+        ds4_rocm_is_gfx1151()) {
+        const __half *w = (const __half *)cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes, "V4.1 tiny HC F16");
+        if (!w) return 0;
+        /* Pair loads require aligned weights and F32 inputs. Tensor views
+         * can be less aligned; retain the scalar kernel for those views. */
+        if (((uintptr_t)w % alignof(__half2)) == 0u &&
+            ((uintptr_t)in->ptr % alignof(float2)) == 0u) {
+            v41_hc_ordered_prefetch_kernel<<<dim3(outputs, rows), 32u>>>(
+                (float *)out->ptr, w, (const float *)in->ptr);
+        } else {
+            matmul_f16_ordered_chunks_kernel<<<dim3(outputs, rows), 32u>>>(
+                (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
+        }
+        return cuda_ok(cudaGetLastError(), "V4.1 tiny HC F16 projection");
+    }
     /* The general batched F16 API casts inputs to F16. Row views preserve decode arithmetic and retain F32 activations. */
     for (uint32_t row = 0; row < rows; row++) {
         ds4_gpu_tensor x = {(float *)in->ptr + (uint64_t)row * width, (uint64_t)width * 4u, 0};
@@ -1042,6 +1164,83 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
         if (!ds4_gpu_matmul_f16_tensor(&y, model_map, model_size, weight_offset, width, outputs, &x, 1u)) return 0;
     }
     return 1;
+}
+
+/* Keep the scalar 256-lane reduction tree. Reuse weights across tiny rows
+ * and replace its final five block barriers with the same warp additions. */
+template <uint32_t TOKENS>
+__global__ static void v41_router_f32_rows_kernel(float *out, const float *weights,
+        const float *input, uint32_t outputs, uint32_t rows) {
+    constexpr uint32_t width = 5120u;
+    const uint32_t lane = threadIdx.x, row = blockIdx.x;
+    float sum[TOKENS] = {};
+    for (uint32_t base = 0; base < 20u; base += 4u) {
+        float w[4], x[TOKENS][4];
+#pragma unroll
+        for (uint32_t u = 0; u < 4u; u++) {
+            const uint32_t col = lane + (base + u) * 256u;
+            w[u] = weights[(uint64_t)row * width + col];
+#pragma unroll
+            for (uint32_t t = 0; t < TOKENS; t++)
+                x[t][u] = t < rows ? input[(uint64_t)t * width + col] : 0.0f;
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < 4u; u++) {
+#pragma unroll
+            for (uint32_t t = 0; t < TOKENS; t++)
+                sum[t] = __fmaf_rn(w[u], x[t][u], sum[t]);
+        }
+    }
+    __shared__ float partial[TOKENS][256];
+#pragma unroll
+    for (uint32_t t = 0; t < TOKENS; t++) partial[t][lane] = sum[t];
+    __syncthreads();
+    for (uint32_t stride = 128u; stride >= 32u; stride >>= 1u) {
+        if (lane < stride) {
+#pragma unroll
+            for (uint32_t t = 0; t < TOKENS; t++)
+                partial[t][lane] += partial[t][lane + stride];
+        }
+        __syncthreads();
+    }
+    if (lane < 32u) {
+#pragma unroll
+        for (uint32_t t = 0; t < TOKENS; t++) {
+            float value = partial[t][lane];
+            for (uint32_t stride = 16u; stride; stride >>= 1u)
+                value += __shfl_down(value, stride, 32);
+            if (lane == 0u && t < rows) out[(uint64_t)t * outputs + row] = value;
+        }
+    }
+}
+
+extern "C" int ds4_gpu_dsv41_f32_projection_rows(ds4_gpu_tensor *out,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t width, uint32_t outputs, uint32_t rows, const ds4_gpu_tensor *in) {
+    uint64_t weight_bytes = 0;
+    if (!width || !outputs || !rows || rows > 6u || !model_map ||
+        !cuda_u64_mul3_checked(width, outputs, sizeof(float), &weight_bytes) ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !cuda_tensor_has_elems2(in, width, rows, 4u) ||
+        !cuda_tensor_has_elems2(out, outputs, rows, 4u)) return 0;
+    const float *w = (const float *)cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes, "V4.1 tiny F32 projection");
+    if (!w) return 0;
+    if (ds4_rocm_is_gfx1151() && width == 5120u &&
+        (outputs == 128u || outputs == 384u)) {
+#define V41_ROUTER_ROWS(T) v41_router_f32_rows_kernel<T><<<outputs, 256u>>>( \
+        (float *)out->ptr, w, (const float *)in->ptr, outputs, rows)
+        if (rows == 1u) { V41_ROUTER_ROWS(1u); }
+        else if (rows == 2u) { V41_ROUTER_ROWS(2u); }
+        else if (rows == 3u) { V41_ROUTER_ROWS(3u); }
+        else { V41_ROUTER_ROWS(6u); }
+#undef V41_ROUTER_ROWS
+        return cuda_ok(cudaGetLastError(), "V4.1 tiny F32 router projection");
+    }
+    /* Preserve the scalar F32 kernel, including its 256-lane reduction tree. */
+    matmul_f32_kernel<<<dim3(outputs, rows), 256u>>>(
+        (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
+    return cuda_ok(cudaGetLastError(), "V4.1 tiny F32 projection");
 }
 
 extern "C" int ds4_gpu_hc_rms_scale_project_f16_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *scale_scratch,
@@ -1170,14 +1369,31 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
         matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 16u><<<dim3(outputs / 256u, (rows + 63u) / 64u), 512u>>>(
             (float *)out->ptr, weights, (const float *)in->ptr,
             rows, width, outputs, UINT64_C(40) * 34u);
-    } else if (!g_quality_mode && rows == 2048u && ds4_rocm_is_gfx1151() &&
+    } else if (!g_quality_mode && rows >= 32u && rows <= 2048u && rows != 128u && ds4_rocm_is_gfx1151() &&
                ((width == 5120u && (outputs == 512u || outputs == 1280u || outputs == 2304u)) ||
                 (width == 2304u && outputs == 5120u))) {
-        /* Query-A, KV and shared-expert projections on a complete prefill tile.
-         * Reuse the generic Q8-to-F16 WMMA path and its F32 accumulation. */
-        matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u><<<dim3(outputs / 128u, 32u), 256u>>>(
-            (float *)out->ptr, weights, (const float *)in->ptr,
-            rows, width, outputs, (uint64_t)(width / 32u) * 34u);
+        /* Query-A, KV and shared-expert projections on prefill/replay tiles.
+         * The shared-F32 path remains faster for the bounded 128-row tile.
+         * A two-host, full-oracle sweep selected the 256-row/pad-8 tile for
+         * the bulk of this topology.  The 32-row input-limited shape favors
+         * 128 rows/pad-8, while Query-A crosses back to the 128-row tile at
+         * the final 1984-row grid step. */
+        if (width == 5120u && rows <= 32u) {
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u, 8u>
+                <<<dim3((outputs + 127u) / 128u, (rows + 63u) / 64u), 256u>>>(
+                    (float *)out->ptr, weights, (const float *)in->ptr,
+                    rows, width, outputs, (uint64_t)(width / 32u) * 34u);
+        } else if (width == 5120u && outputs == 512u && rows >= 1984u) {
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u>
+                <<<dim3((outputs + 127u) / 128u, (rows + 63u) / 64u), 256u>>>(
+                    (float *)out->ptr, weights, (const float *)in->ptr,
+                    rows, width, outputs, (uint64_t)(width / 32u) * 34u);
+        } else {
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 8u>
+                <<<dim3((outputs + 255u) / 256u, (rows + 63u) / 64u), 512u>>>(
+                    (float *)out->ptr, weights, (const float *)in->ptr,
+                    rows, width, outputs, (uint64_t)(width / 32u) * 34u);
+        }
     } else if (width == 1280u && outputs == 32768u && rows >= 32u && rows <= 2048u && ds4_rocm_is_gfx1151()) {
         /* Reuse sixteen query-B activation rows with the same F32 lane
          * accumulation and wave reduction; keep the existing block tile. */

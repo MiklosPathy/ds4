@@ -99,7 +99,7 @@ Download the pinned native-MXFP4 support GGUF from the [resident setup](STRIX_HA
   --transport rdma --rdma-device "$DEV" --rdma-port "$PORT" --rdma-gid-index "$GID"
 ```
 
-Production sampled DSpark is functionally qualified over TCP and RoCE. In the retained 7,642-prompt-token plus 256-output-token RoCE coding run it measured 15.76 tok/s versus 16.25 tok/s target-only, so it is not a distributed speed recommendation.
+Production sampled DSpark is qualified over TCP and RoCE. Speed depends on the request and draft acceptance; compare it with target-only decoding on the intended workload.
 
 ## Vision and first request
 

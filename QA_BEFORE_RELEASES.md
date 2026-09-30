@@ -1698,7 +1698,7 @@ Exclude loading. Only the first row is initial prefill; later rows are appends.
 - Resident, SSD, TCP and RoCE serving checks cover coding/tool use, state restore/rewind, cancellation, session reuse and all 23 vision/cache cases. Final TCP/RoCE checks each complete 16 JSON replies, 16 SSE replies and four cancellations. Cross-schedule reply equality is not a promised contract; protocol/state checks pass.
 - Vision attention: 390 independent kernel checks and 63 full encoder captures across seven images preserve outputs bitwise, including boundary-size tests and the small-image fallback.
 - Shared units, Linux TCP stress tests, ROCm transport/gate reuse and injected-failure checks, and five frontend build/link/help checks pass. No fresh physical Metal or GLM regression run is claimed.
-- Exactly two machines, each fitting its assigned experts in RAM; no cluster SSD streaming or DSpark. RoCE uses system-RAM staging. Populated 256K and long-running production endurance are unqualified.
+- Exactly two machines, each fitting its assigned experts in RAM; no cluster SSD streaming. ROCm DSpark supports resident target experts on one or two machines. RoCE uses system-RAM staging. Populated 256K and long-running production endurance are unqualified.
 - Hardware, native performance and commands: [single-node SSD](docs/STRIX_HALO.md#deepseek-v41-flash), [TCP/RoCE](docs/CLUSTERING_ROCM.md#measured-performance).
 
 ### CUDA SSD Streaming

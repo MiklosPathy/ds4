@@ -1238,6 +1238,21 @@ static int routed_moe_launch(
              use_rocm_mmq_gateup) &&
             (out_dim & 1u) == 0u && !g_quality_mode;
         half *iq2_hot_mid_h = use_iq2_hot_f16_mid ? (half *)gate->ptr : NULL;
+        half *mmq_epilogue_mid_h = NULL;
+        if (use_rocm_mmq_gateup && use_iq2_hot_f16_mid) {
+            uint64_t down_h_bytes = 0;
+            uint64_t mid_h_bytes = 0;
+            if (cuda_u64_mul3_checked(pair_count64, out_dim, sizeof(half),
+                                      &down_h_bytes) &&
+                cuda_u64_mul3_checked(pair_count64, expert_mid_dim, sizeof(half),
+                                      &mid_h_bytes) &&
+                down_h_bytes <= down->bytes &&
+                mid_h_bytes <= down->bytes - down_h_bytes) {
+                mmq_epilogue_mid_h =
+                    (half *)((char *)down->ptr + down_h_bytes);
+                iq2_hot_mid_h = mmq_epilogue_mid_h;
+            }
+        }
         const int use_iq2_x_f16 = use_iq2_gate_wmma && iq2_gate_hot_count != 0u &&
             up->bytes >= (uint64_t)n_tokens * expert_in_dim * sizeof(half);
         half *iq2_x_h = use_iq2_x_f16 ? (half *)up->ptr : NULL;
@@ -1249,6 +1264,7 @@ static int routed_moe_launch(
         int mmq_gateup_done = 0;
         if (ok && use_rocm_mmq_gateup) {
             int mmq_rc = ds4_mmq_init(0) == 0 ? 0 : -1;
+            const int use_fused_swiglu = mmq_epilogue_mid_h != NULL;
             /* The gfx1151 MMQ pair is stable through 2048 token rows. Tile
              * larger prefills instead of letting its flattened assignment
              * grid corrupt the tail of a 4096-row batch. */
@@ -1263,37 +1279,58 @@ static int routed_moe_launch(
                     (uint64_t)token0 * n_expert;
                 const uint64_t out_offset =
                     pair_offset * expert_mid_dim;
-                mmq_rc = ds4_mmq_iq2_xxs_moe_pair(
-                    gate_w, up_w,
-                    (const float *)x->ptr + x_offset,
-                    (const int32_t *)selected_exec->ptr + pair_offset,
-                    (float *)gate->ptr + out_offset,
-                    (float *)up->ptr + out_offset,
-                    (int)expert_mid_dim, (int)expert_in_dim,
-                    (int)tile_tokens, (int)n_total_expert, (int)n_expert,
-                    (cudaStream_t)0);
+                if (use_fused_swiglu) {
+                    mmq_rc = ds4_mmq_iq2_xxs_moe_pair_swiglu(
+                        gate_w, up_w,
+                        (const float *)x->ptr + x_offset,
+                        (const int32_t *)selected_exec->ptr + pair_offset,
+                        (const float *)weights->ptr + pair_offset,
+                        (float *)gate->ptr + out_offset,
+                        (float *)up->ptr + out_offset,
+                        (float *)mid->ptr + out_offset,
+                        mmq_epilogue_mid_h + out_offset,
+                        (int)expert_mid_dim, (int)expert_in_dim,
+                        (int)tile_tokens, (int)n_total_expert, (int)n_expert,
+                        clamp, (cudaStream_t)0);
+                } else {
+                    mmq_rc = ds4_mmq_iq2_xxs_moe_pair(
+                        gate_w, up_w,
+                        (const float *)x->ptr + x_offset,
+                        (const int32_t *)selected_exec->ptr + pair_offset,
+                        (float *)gate->ptr + out_offset,
+                        (float *)up->ptr + out_offset,
+                        (int)expert_mid_dim, (int)expert_in_dim,
+                        (int)tile_tokens, (int)n_total_expert, (int)n_expert,
+                        (cudaStream_t)0);
+                }
                 token0 += tile_tokens;
             }
             if (mmq_rc == 0) {
                 const uint64_t mid_count = pair_count64 * expert_mid_dim;
-                moe_swiglu_weighted_f32_kernel<<<
-                    (uint32_t)((mid_count + 255u) / 256u), 256>>>(
-                    (float *)mid->ptr, (const float *)gate->ptr,
-                    (const float *)up->ptr, (const float *)weights->ptr,
-                    mid_count, expert_mid_dim, clamp);
-                mmq_gateup_done = cuda_ok(
-                    cudaGetLastError(), "routed_moe MMQ gate/up epilogue launch");
-                if (mmq_gateup_done && use_iq2_hot_f16_mid) {
-                    f32_to_f16_kernel<<<
+                if (use_fused_swiglu) {
+                    mmq_gateup_done = 1;
+                } else {
+                    moe_swiglu_weighted_f32_kernel<<<
                         (uint32_t)((mid_count + 255u) / 256u), 256>>>(
-                        iq2_hot_mid_h, (const float *)mid->ptr, mid_count);
+                        (float *)mid->ptr, (const float *)gate->ptr,
+                        (const float *)up->ptr, (const float *)weights->ptr,
+                        mid_count, expert_mid_dim, clamp);
                     mmq_gateup_done = cuda_ok(
-                        cudaGetLastError(), "routed_moe MMQ mid f16 launch");
+                        cudaGetLastError(), "routed_moe MMQ gate/up epilogue launch");
+                    if (mmq_gateup_done && use_iq2_hot_f16_mid) {
+                        f32_to_f16_kernel<<<
+                            (uint32_t)((mid_count + 255u) / 256u), 256>>>(
+                            iq2_hot_mid_h, (const float *)mid->ptr, mid_count);
+                        mmq_gateup_done = cuda_ok(
+                            cudaGetLastError(), "routed_moe MMQ mid f16 launch");
+                    }
                 }
                 static int logged_mmq_gateup = 0;
                 if (mmq_gateup_done && !logged_mmq_gateup) {
                     logged_mmq_gateup = 1;
-                    fprintf(stderr, "ds4: ROCm routed MoE using tuned MMQ IQ2 gate/up\n");
+                    fprintf(stderr,
+                        "ds4: ROCm routed MoE using tuned MMQ IQ2 gate/up%s\n",
+                        use_fused_swiglu ? " with fused SwiGLU write-back" : "");
                 }
             } else if (!v41_mmq_topology) {
                 (void)cudaGetLastError();
