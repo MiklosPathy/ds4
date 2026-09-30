@@ -1338,7 +1338,7 @@ int ds4_mmq_moe_pair_impl(
         return -1;
     }
     if (swiglu_epilogue &&
-        (type != GGML_TYPE_IQ2_XXS || fused_down ||
+        ((type != GGML_TYPE_IQ2_XXS && type != GGML_TYPE_Q4_K) || fused_down ||
          !swiglu_epilogue->router_weights || !swiglu_epilogue->mid_f32)) {
         fprintf(stderr, "%s: invalid weighted SwiGLU epilogue\n", tag);
         return -1;
@@ -2288,6 +2288,27 @@ extern "C" int ds4_mmq_q4_K_moe_pair(
     return ds4_mmq_moe_pair_impl<GGML_TYPE_Q4_K>(
         "ds4_mmq_q4_K_moe_pair", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
+}
+
+/* Q4_K twin of ds4_mmq_iq2_xxs_moe_pair_swiglu for the owned-expert
+ * tensor-parallel prefill. */
+extern "C" int ds4_mmq_q4_K_moe_pair_swiglu(
+        const void * W_gate, const void * W_up,
+        const float * X, const int32_t * ids, const float * router_weights,
+        float * gate, float * discard, float * mid_f32, void * mid_f16,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        float clamp, cudaStream_t stream) {
+    const ds4_mmq_swiglu_epilogue epilogue = {
+        router_weights,
+        mid_f32,
+        (half *)mid_f16,
+        clamp,
+    };
+    return ds4_mmq_moe_pair_impl<GGML_TYPE_Q4_K>(
+        "ds4_mmq_q4_K_moe_pair_swiglu", W_gate, W_up, X, ids,
+        gate, discard, M, K, n_tokens, n_experts, n_expert_used, stream,
+        nullptr, nullptr, 0, /*sanitize_out=*/false, nullptr,
+        /*allow_d2r=*/false, &epilogue);
 }
 
 extern "C" int ds4_mmq_mxfp4_moe_pair(

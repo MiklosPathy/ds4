@@ -3032,20 +3032,17 @@ extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
         for (uint32_t t0 = 0; rc == 0 && t0 < n_tokens; ) {
             const uint32_t rows = n_tokens - t0 < cap ? n_tokens - t0 : cap;
             const uint64_t p0 = (uint64_t)t0 * n_expert;
-            rc = ds4_mmq_q4_K_moe_pair(gw, uw, (const float *)x->ptr + (uint64_t)t0 * expert_in_dim,
-                (const int32_t *)selected->ptr + p0,
+            /* Fused write-back: clamp, SwiGLU and router weighting land in
+             * mid with the up projection. Foreign slots get no work, so
+             * their mid rows stay unwritten; the down MMQ and the owned sum
+             * skip them as well. */
+            rc = ds4_mmq_q4_K_moe_pair_swiglu(gw, uw, (const float *)x->ptr + (uint64_t)t0 * expert_in_dim,
+                (const int32_t *)selected->ptr + p0, (const float *)weights->ptr + p0,
                 (float *)gate->ptr + p0 * expert_mid_dim, (float *)up->ptr + p0 * expert_mid_dim,
+                (float *)mid->ptr + p0 * expert_mid_dim, NULL,
                 (int)expert_mid_dim, (int)expert_in_dim, (int)rows,
-                (int)resident_expert_count, (int)n_expert, (cudaStream_t)0);
+                (int)resident_expert_count, (int)n_expert, clamp, (cudaStream_t)0);
             t0 += rows;
-        }
-        if (rc == 0) {
-            /* Zero weights turn unwritten foreign gate/up rows into zero mid. */
-            const uint64_t mid_count = pair_count * expert_mid_dim;
-            moe_swiglu_weighted_f32_kernel<<<(uint32_t)((mid_count + 255u) / 256u), 256>>>(
-                (float *)mid->ptr, (const float *)gate->ptr, (const float *)up->ptr,
-                (const float *)weights->ptr, mid_count, expert_mid_dim, clamp);
-            rc = cuda_ok(cudaGetLastError(), "TP3 MMQ swiglu") ? 0 : -1;
         }
         const uint32_t pair_cap = cap;
         for (uint64_t q0 = 0; rc == 0 && q0 < pair_count; ) {
