@@ -802,6 +802,8 @@ static int check_dspark_markov(void) {
 
 static int check_projection(void) {
     const struct { uint32_t width, out, rows; } shapes[] = {
+        {20480,24,1}, {20480,24,2}, {20480,24,3}, {20480,24,4},
+        {20480,24,5}, {20480,24,6}, {20480,24,7},
         {1280,4096,1}, {1280,4096,33}, {5120,32,31}, {5120,512,9}, {512,128,513}, {20480,24,33},
         {6144,25600,2}, {6144,25600,3}, {6144,25600,4}, {6144,25600,5}, {6144,25600,6},
         {5120,32,32}, {5120,32,33}, {5120,32,127}, {5120,32,128}, {5120,32,129},
@@ -848,6 +850,55 @@ static int check_projection(void) {
     fprintf(stderr, "F16 projection width=%u out=%u rows=%u scalar exact, double worst=%.9g\n", width, output, rows, worst);
     CHECK(!ds4_gpu_dsv41_projection_rows(out, model, weight_bytes - 1, 0, width, output, rows, xt));
     CHECK(!ds4_gpu_dsv41_projection_rows(out, model, weight_bytes, 0, width, output, rows + 1, xt));
+    ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(ref);
+    ds4_gpu_cleanup(); free(model); free(input); free(actual); free(scalar);
+    return ds4_gpu_init();
+}
+
+static int check_f32_projection(void) {
+    const struct { uint32_t width, out, rows; } shapes[] = {
+        {5120,384,1}, {5120,384,2}, {5120,384,3}, {5120,384,4},
+        {5120,384,5}, {5120,384,6}, {5120,128,1}, {5120,128,2},
+        {5120,128,3}, {5120,128,4}, {5120,128,5}, {5120,128,6}, {513,17,3}
+    };
+    const uint32_t width = shapes[requested_shape].width, output = shapes[requested_shape].out, rows = shapes[requested_shape].rows;
+    const size_t weight_bytes = (size_t)width * output * 4, nx = (size_t)width * rows, ny = (size_t)output * rows;
+    void *model = NULL;
+    CHECK(!posix_memalign(&model, (size_t)sysconf(_SC_PAGESIZE), weight_bytes));
+    float *weights = model;
+    float *input = malloc(nx * 4), *actual = malloc(ny * 4), *scalar = malloc(ny * 4);
+    CHECK(input && actual && scalar);
+    for (size_t i = 0; i < weight_bytes / 4; i++) weights[i] = random_value();
+    for (size_t i = 0; i < nx; i++) input[i] = i % 511 ? bf16(random_value()) : 1.0001f;
+    CHECK(ds4_gpu_set_model_map(model, weight_bytes));
+    ds4_gpu_tensor *xt = upload(input, nx * 4), *out = upload(NULL, ny * 4), *ref = upload(NULL, ny * 4);
+    CHECK(xt && out && ref);
+    RUN(ds4_gpu_dsv41_f32_projection_rows(out, model, weight_bytes, 0, width, output, rows, xt));
+    CHECK(ds4_gpu_tensor_read(out, 0, actual, ny * 4));
+    for (uint32_t row = 0; row < rows; row++) {
+        ds4_gpu_tensor *xr = ds4_gpu_tensor_view(xt, (size_t)row * width * 4, width * 4);
+        ds4_gpu_tensor *yr = ds4_gpu_tensor_view(ref, (size_t)row * output * 4, output * 4);
+        CHECK(xr && yr);
+        RUN(ds4_gpu_matmul_f32_tensor(yr, model, weight_bytes, 0, width, output, xr, 1));
+        ds4_gpu_tensor_free(xr); ds4_gpu_tensor_free(yr);
+    }
+    CHECK(ds4_gpu_tensor_read(ref, 0, scalar, ny * 4));
+    CHECK(!memcmp(actual, scalar, ny * 4));
+    double worst = 0;
+    for (uint32_t row = 0; row < rows; row++) for (uint32_t o = 0; o < output; o++) {
+        double sum = 0, magnitude = 0;
+        for (uint32_t k = 0; k < width; k++) {
+            const double term = (double)weights[(size_t)o * width + k] * input[(size_t)row * width + k];
+            sum += term; magnitude += fabs(term);
+        }
+        const float got = actual[(size_t)row * output + o];
+        const double error = fabs(got - sum) / fmax(magnitude, 1);
+        CHECK(isfinite(got) && error < 1e-6);
+        worst = fmax(worst, error);
+    }
+    fprintf(stderr, "F32 projection width=%u out=%u rows=%u scalar exact, double worst=%.9g\n", width, output, rows, worst);
+    CHECK(!ds4_gpu_dsv41_f32_projection_rows(out, model, weight_bytes - 1, 0, width, output, rows, xt));
+    CHECK(!ds4_gpu_dsv41_f32_projection_rows(out, model, weight_bytes, 0, width, output, rows + 1, xt));
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(ref);
     ds4_gpu_cleanup(); free(model); free(input); free(actual); free(scalar);
     return ds4_gpu_init();
@@ -1185,7 +1236,8 @@ static const test_case cases[] = {
     {"dspark-hc", 3, check_dspark_hc_mean},
     {"dspark-router", 1, check_dspark_router},
     {"dspark-markov", 3, check_dspark_markov},
-    {"projection", 21, check_projection},
+    {"projection", 28, check_projection},
+    {"f32-projection", 13, check_f32_projection},
     {"hc", 4, check_hc_scaled},
     {"q8-prefill-projection", 28, check_q8_prefill_projection},
     {"attention-output", 6, check_attention_output},

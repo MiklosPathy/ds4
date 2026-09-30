@@ -40707,6 +40707,13 @@ static bool g_ds41_dspark_verify_dense;
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
 #ifdef DS4_ROCM_BUILD
+    if (weight->type == DS4_TENSOR_F32 && weight->dim[0] == 5120u &&
+        (weight->dim[1] == 128u || weight->dim[1] == 384u)) {
+        const bool ok = ds4_gpu_dsv41_f32_projection_rows(out, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0],
+            (uint32_t)weight->dim[1], 1u, in);
+        return ok && (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
+    }
     if (weight->type == DS4_TENSOR_F16 || weight->type == DS4_TENSOR_Q8_0) {
         const bool ok = weight->type == DS4_TENSOR_F16 ?
             ds4_gpu_dsv41_projection_rows(out, m->map, m->size, weight->abs_offset,
@@ -40726,6 +40733,11 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
     const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
     bool ok;
 #ifdef DS4_ROCM_BUILD
+    if (weight->type == DS4_TENSOR_F32 && count >= 2u && count <= 6u) {
+        ok = ds4_gpu_dsv41_f32_projection_rows(out, m->map, m->size,
+            weight->abs_offset, width, outputs, count, in);
+        return ok && (!round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16));
+    }
     /* Full-tile Q8 WMMA uses F16 operands internally. Preserve the graph's
      * requested output rounding after either projection. */
     if (!g_ds41_dspark_verify_dense &&
