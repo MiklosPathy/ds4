@@ -90,7 +90,7 @@ Resident and TP inference also batch continued prefills automatically.
 
 For concurrent serving, see [session batching](SERVER.md#multiple-sessions).
 Each slot needs its own context memory; start with `--ctx 4096` before
-increasing both context and slot count. CUDA Q2 SSD mode batches up to eight decode rows; CUDA network TP currently serves sessions in order. DSpark and pipeline execution are unsupported for V4.1. ROCm network TP requires resident expert shards; SSD streaming is single-node only.
+increasing both context and slot count. CUDA Q2 SSD mode batches up to eight decode rows; CUDA network TP currently serves sessions in order. ROCm DSpark supports resident experts on one or two machines with the matching [V4.1 support GGUF](STRIX_HALO.md#resident-dspark-speculative-decoding). Pipeline execution remains unsupported for V4.1. ROCm network TP requires resident expert shards; SSD streaming is single-node only.
 
 Scalar, batched and tensor-parallel execution are not numerically identical.
 Q4 batched prefill shows a small probability-score loss on the short official
