@@ -101,3 +101,9 @@ ds4-kernel-v41-tp-gates
 /tests/test_q8_prefill_variants
 /tests/test_tp3_mesh
 ds4-kernel-v41-tp3
+
+# Rebuilt Halo code objects and host shape test.
+/rocm/halo/output_b/code.inc
+/tests/test_halo_shapes
+
+/ds4-kernel-halo-moe

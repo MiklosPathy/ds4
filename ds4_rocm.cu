@@ -148,6 +148,9 @@ __device__ __constant__ static const int8_t cuda_mxfp4_values_x2[16] = {
 
 static int ds4_rocm_is_gfx1151(void);
 
+#include "rocm/ds4_rocm_halo_output_b_module.cuh"
+#include "rocm/ds4_rocm_halo_moe.h"
+#include "rocm/ds4_rocm_halo_q2.h"
 #include "rocm/ds4_rocm_runtime.cuh"
 
 #include "rocm/ds4_rocm_common.cuh"
@@ -157,6 +160,10 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 }
 
 #include "rocm/ds4_rocm_q8.cuh"
+#include "rocm/ds4_rocm_halo_q8.cuh"
+#include "rocm/ds4_rocm_halo_output_a.cuh"
+#include "rocm/ds4_rocm_halo_output_a_uncached.cuh"
+#include "rocm/ds4_rocm_halo_shared_down.cuh"
 
 #include "rocm/ds4_rocm_norm_rope.cuh"
 
@@ -164,6 +171,10 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 
 #include "rocm/ds4_rocm_attention.cuh"
 #include "rocm/ds4_rocm_attention_gufo.cuh"
+#include "rocm/ds4_rocm_halo_static_query.cuh"
+#include "rocm/ds4_rocm_halo_hc.cuh"
+#include "rocm/ds4_rocm_halo_direct_qk.cuh"
+#include "rocm/ds4_rocm_halo_attention.cuh"
 
 #include "rocm/ds4_rocm_hc.cuh"
 
@@ -187,6 +198,7 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 #include "rocm/ds4_rocm_router.cuh"
 
 #include "rocm/ds4_rocm_moe.cuh"
+#include "rocm/ds4_rocm_halo_q2.cuh"
 
 #include "rocm/ds4_rocm_moe_launch.cuh"
 
