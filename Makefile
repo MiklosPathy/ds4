@@ -900,7 +900,7 @@ ds4-kernel-v41-tp-attention: tests/test_deepseek41_tp_rocm.o ds4_rocm.o ds4_imag
 tests/test_deepseek41_tp3_rocm.o: tests/test_deepseek41_tp3_rocm.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -ffp-contract=off $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-ds4-kernel-v41-tp3: tests/test_deepseek41_tp3_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS)
+ds4-kernel-v41-tp3: tests/test_deepseek41_tp3_rocm.o ds4_rocm.o ds4_image.rocm.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 tests/test_deepseek41_attention_gufo_rocm.o: tests/test_deepseek41_attention_gufo_rocm.c ds4_gpu.h
