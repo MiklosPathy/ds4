@@ -1018,6 +1018,16 @@ test-deepseek41-gguf: tests/test_deepseek41_gguf
 	./tests/test_deepseek41_gguf
 
 ifeq ($(UNAME_S),Linux)
+.PHONY: test-dspark-family
+test-dspark-family: tests/test_dspark_family.c ds4.c ds4.h
+	@set -eu; \
+	test_bin=$$(mktemp "$${TMPDIR:-/tmp}/ds4-dspark-family.XXXXXX"); \
+	trap 'rm -f "$$test_bin"' EXIT; \
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -O0 -UNDEBUG -DDS4_NO_GPU \
+		-Wno-unused-function -ffunction-sections -fdata-sections -I. \
+		tests/test_dspark_family.c -Wl,--gc-sections $(LDLIBS) -o "$$test_bin"; \
+	"$$test_bin"
+
 .PHONY: test-deepseek41-memory
 test-deepseek41-memory: tests/test_deepseek41_memory.c ds4.c ds4.h ds4_gpu.h ds4_linux_memory.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	@set -eu; \

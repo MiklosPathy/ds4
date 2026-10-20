@@ -3318,9 +3318,14 @@ static bool support_model_checkpoint_compatible(const ds4_model *m) {
     ds4_str family = {0}, arch = {0};
     const bool has_family = model_get_string(m, "dspark.target_architecture", &family);
     const bool has_arch = model_get_string(m, "general.architecture", &arch);
-    const bool v41 = has_family && ds4_streq(family, "deepseek41") &&
-                     has_arch && ds4_streq(arch, "deepseek41-dspark");
+    /* Earlier V4.1 sidecars identify the family through general.architecture
+     * alone. Accept that published format, but never ignore an explicit
+     * conflicting or malformed target_architecture field. */
+    const bool family_declared = model_find_kv(m, "dspark.target_architecture") != NULL;
+    const bool v41 = has_arch && ds4_streq(arch, "deepseek41-dspark") &&
+                     (!family_declared || (has_family && ds4_streq(family, "deepseek41")));
     if ((DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) != v41 ||
+        (family_declared && !has_family) ||
         (has_family && !v41 && !ds4_streq(family, "deepseek4")) ||
         (has_arch && ds4_streq(arch, "deepseek41-dspark") && !v41)) {
         fprintf(stderr, "ds4: DSpark support model and target checkpoint families differ\n");
@@ -42818,11 +42823,39 @@ static bool ds41_draft_attention_output(ds41_gpu_graph *g,
      * The persistent row views are repacked to half width for target TP, so
      * they cannot describe support-model attention here.  The batch kernel
      * also keeps all speculative rows in one tuned tiny-row launch. */
-    if (l->attn_output_b->type == DS4_TENSOR_Q8_0)
+    if (l->attn_output_a->type == DS4_TENSOR_Q8_0 &&
+        l->attn_output_b->type == DS4_TENSOR_Q8_0)
         return ds4_gpu_dsv41_attention_output_batch(g->batch.block,
             g->batch.low, m->map, m->size, l->attn_output_a->abs_offset,
             l->attn_output_b->abs_offset, g->batch.heads, count);
-#endif
+    /* Lossless sidecars store these projections as F16/F32. The target's
+     * scalar attention-low helper is Q8-specific, and TP target row views
+     * have half-width strides. Use typed slices of the full draft workspace. */
+    const uint32_t groups = DS4_N_OUT_GROUP;
+    const uint32_t width = DS4_N_HEAD * DS4_N_HEAD_DIM / groups;
+    uint64_t weight_row;
+    if (g->tp_world != 1u ||
+        !tensor_nbytes(l->attn_output_a->type, width, &weight_row)) return false;
+    for (uint32_t row = 0; row < count; row++) {
+        for (uint32_t group = 0; group < groups; group++) {
+            ds4_tensor slice = *l->attn_output_a;
+            slice.abs_offset += (uint64_t)group * DS4_N_LORA_O * weight_row;
+            slice.dim[1] = DS4_N_LORA_O;
+            ds4_gpu_tensor *x = ds4_gpu_tensor_view(g->batch.heads,
+                ((uint64_t)row * groups + group) * width * sizeof(float),
+                (uint64_t)width * sizeof(float));
+            ds4_gpu_tensor *y = ds4_gpu_tensor_view(g->batch.low,
+                ((uint64_t)row * groups + group) * DS4_N_LORA_O * sizeof(float),
+                (uint64_t)DS4_N_LORA_O * sizeof(float));
+            const bool ok = x && y && ds41_matmul(y, m, &slice, x, true);
+            ds4_gpu_tensor_free(y);
+            ds4_gpu_tensor_free(x);
+            if (!ok) return false;
+        }
+    }
+    return ds41_matmul_batch(g->batch.block, m, l->attn_output_b,
+                             g->batch.low, count, false);
+#else
     ds41_gpu_graph row = *g;
     for (uint32_t t = 0; t < count; t++) {
         row.heads = g->rows_view[t].heads;
@@ -42831,6 +42864,7 @@ static bool ds41_draft_attention_output(ds41_gpu_graph *g,
         if (!ds41_attention_output(&row, m, l)) return false;
     }
     return true;
+#endif
 }
 
 static bool ds41_draft_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
@@ -88475,7 +88509,9 @@ static int ds41_session_spec(ds4_session *s, int first_token,
     double propose_seconds = 0.0;
     const bool cost_scheduled = !e->dspark_confidence_threshold_set &&
         ds4_session_dspark_rocm_gfx1151_fast_path(s);
-    const bool draftable = pos >= 1u && d->mh_rows &&
+    /* The caller already selected the seed. A stop seed must commit alone,
+     * matching the generic and upstream V4.1 speculative API contract. */
+    const bool draftable = first_token != eos_token && pos >= 1u && d->mh_rows &&
         pos - 1u >= d->mh_pos0 && pos - 1u < d->mh_pos0 + d->mh_rows &&
         pos + B < g->ctx && max_tokens > 1 && accepted_cap > 1;
     /* The cost scheduler already returns width zero when drafting loses
