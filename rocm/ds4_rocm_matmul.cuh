@@ -433,7 +433,7 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
                                                      x, n_tok, "q8_f16_out");
 }
 
-static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
+static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label, bool decode_rows = false) {
     if (!out || !x || !model_map ||
         in_dim == 0u || out_dim == 0u || n_tok == 0u ||
         in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) return 0;
@@ -460,7 +460,19 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
            in_dim == 16384u)) ||
          (in_dim == 1536u && out_dim == 16384u)) &&
         ds4_rocm_is_gfx1151() && ds4_engine_is_glm53(NULL);
-    if (n_tok > 1 && !g_quality_mode && !glm_q8_tok2_preq &&
+    /* Explicit decode rows retain scalar activation quantization. In quality
+     * mode retain the scalar reduction too, rather than a WMMA prefill tile. */
+    if (decode_rows && n_tok > 1 && !cuda_q8_prequant_decode_enabled()) {
+        for (uint64_t row = 0; row < n_tok; row++) {
+            ds4_gpu_tensor xr = *x, yr = *out;
+            xr.ptr = (float *)x->ptr + row * in_dim; xr.bytes = in_dim * sizeof(float);
+            yr.ptr = (float *)out->ptr + row * out_dim; yr.bytes = out_dim * sizeof(float);
+            if (!cuda_matmul_q8_0_tensor_labeled(&yr, model_map, model_size,
+                    weight_offset, in_dim, out_dim, &xr, 1, label)) return 0;
+        }
+        return 1;
+    }
+    if (!decode_rows && n_tok > 1 && !g_quality_mode && !glm_q8_tok2_preq &&
         cuda_runtime_config()->shared_down_cublas && in_dim == 2048u && out_dim == 4096u &&
         cuda_matmul_q8_0_tensor_f16_gemm(out, model_map, model_size, weight_offset,
                                          in_dim, out_dim, x, n_tok, label ? label : "shared_expert")) {
@@ -525,7 +537,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 blocks);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 warp launch");
     }
-    if (n_tok > 1 && !glm_q8_tok2_preq) {
+    if (n_tok > 1 && !decode_rows && !glm_q8_tok2_preq) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         if (!g_quality_mode &&
             g_dspark_verify_mode && n_tok <= 6u &&
@@ -690,7 +702,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 blocks);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch warp launch");
     }
-    if (g_cublas_ready && n_tok > 1 && !glm_q8_tok2_preq) {
+    if (g_cublas_ready && n_tok > 1 && !decode_rows && !glm_q8_tok2_preq) {
         const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
         if (w_f16) {
             const uint64_t xh_count = n_tok * in_dim;
@@ -791,6 +803,14 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
                                            in_dim, out_dim, x, n_tok, "q8_0");
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_rows) {
+    return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size,
+        weight_offset, in_dim, out_dim, x, n_rows, "q8_0_decode_rows", true);
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_decode_mpp_tensor(

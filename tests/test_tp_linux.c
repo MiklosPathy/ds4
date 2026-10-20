@@ -268,7 +268,10 @@ static void backend_options(void) {
 }
 
 int main(void) {
-    assert(DS4_TP_PROTOCOL_VERSION==15);
+    assert(DS4_TP_PROTOCOL_VERSION==22);
+    assert(DS4_TP_FRAME_DSPARK_DRAFT==23);
+    assert(DS4_TP_FRAME_SPEC_RESTORE==24);
+    assert(DS4_TP_FRAME_RESTORE_PAYLOAD==25);
     backend_options();
     negotiation(); handshakes(); transfers(); failures(); cancellation(); checkpoint_streams();
     puts("Linux TP: negotiation, full-duplex TCP I/O, tails, canaries, generations and failures PASS");

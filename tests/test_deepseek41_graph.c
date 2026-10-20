@@ -432,7 +432,10 @@ done:
     ds4_session_free(too_large);
     ds4_session_free(s);
     ds4_engine_close(engine);
-    if (cwd_fd >= 0) { fchdir(cwd_fd); close(cwd_fd); }
+    if (cwd_fd >= 0) {
+        if (fchdir(cwd_fd) != 0) { perror("restore working directory"); rc = 1; }
+        close(cwd_fd);
+    }
     return rc;
 }
 
@@ -1850,7 +1853,7 @@ static int check_vision_encoder(const char *path, const char *image, const char 
     e->vision_ready = true;
     g_ds4_shape = DS4_SHAPE_FLASH41;
     model_open(&e->vision_model, path, true, false);
-    deepseek4_vision_weights_bind(&e->deepseek4_vision_weights, &e->vision_model);
+    deepseek4_vision_weights_bind(&e->deepseek4_vision_weights, &e->vision_model, &e->model);
     ds4_vision_embedding first = {0}, second = {0};
     FILE *fp = NULL;
     char error[256] = {0};

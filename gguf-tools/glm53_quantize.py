@@ -298,12 +298,18 @@ class SourceDB:
         index_validator=validate_glm53_index,
         scale_validator=validate_fp8_scales,
         tensor_filter=None,
+        tensor_prefix=None,
     ):
         """With a tensor_filter, only the shards holding a selected tensor are opened."""
         self.hf_dir = hf_dir
         index_path = os.path.join(hf_dir, "model.safetensors.index.json")
         document, self.weight_map = load_index(index_path)
         index_validator(self.weight_map)
+        if tensor_prefix is not None:
+            self.weight_map = {name: shard for name, shard in self.weight_map.items()
+                               if name.startswith(tensor_prefix)}
+            if not self.weight_map:
+                fail(f"source index has no tensors matching {tensor_prefix!r}")
         self.declared_bytes = document.get("metadata", {}).get("total_size")
         self.tensor_filter = tensor_filter
         self.tensors = {}
@@ -316,6 +322,8 @@ class SourceDB:
             if not os.path.isfile(path):
                 fail(f"missing source shard {path}")
             for name, info in load_safetensors_header(path).items():
+                if tensor_prefix is not None and not name.startswith(tensor_prefix):
+                    continue
                 if self.weight_map.get(name) != shard:
                     fail(f"index assigns {name} to {self.weight_map.get(name)!r}, not {shard}")
                 if name not in wanted:

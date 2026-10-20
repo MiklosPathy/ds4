@@ -436,6 +436,7 @@ static char *json_minify_raw_value(const char *json) {
 }
 
 #define SERVER_IMAGE_MARKER_BYTES 64
+#define SERVER_MAX_IMAGES 256u
 
 typedef struct {
     char marker[SERVER_IMAGE_MARKER_BYTES];
@@ -3651,8 +3652,8 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
         return true;
     }
-    if (count > 16) {
-        snprintf(err, errlen, "too many images; at most 16 are allowed");
+    if (count > SERVER_MAX_IMAGES) {
+        snprintf(err, errlen, "too many images; at most %u are allowed", SERVER_MAX_IMAGES);
         return false;
     }
     if (!e || !s || !ds4_engine_has_vision(e)) {
@@ -10063,13 +10064,13 @@ typedef struct {
  * before any prefix is reused. Normalization preserves all byte offsets. */
 typedef struct {
     size_t count;
-    size_t offsets[16];
+    size_t offsets[SERVER_MAX_IMAGES];
 } visible_image_key;
 
 static char *visible_prompt_key(const request *req, const char *text,
                                  visible_image_key *images) {
     memset(images, 0, sizeof(*images));
-    if (!req || !text || req->image_count > 16 ||
+    if (!req || !text || req->image_count > SERVER_MAX_IMAGES ||
         (req->image_count && !req->image_markers)) return NULL;
     char *key = xstrdup(text);
     const char *cursor = text;
@@ -11648,8 +11649,8 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
                                       const request *req, const char *suffix,
                                       ds4_tokens *out) {
     const ds4_tokens *live = ds4_session_tokens(slot->session);
-    if (!live || !suffix || req->image_count > 16) return false;
-    ds4_vision_span spans[16];
+    if (!live || !suffix || req->image_count > SERVER_MAX_IMAGES) return false;
+    ds4_vision_span spans[SERVER_MAX_IMAGES];
     size_t old_count = req->image_count;
     for (size_t i = 0; i < req->image_count; i++) {
         if (!req->image_markers) return false;
@@ -12778,8 +12779,16 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
  * it, retaining image conditioning as well. */
 static int server_generation_rewind(server *s, server_slot *slot,
                                      const request *r, int pos,
+                                     bool resample, int last_token,
                                      char *err, size_t errlen) {
     pthread_mutex_lock(&s->inference_mu);
+    /* A mode change only needs logits at the retained boundary. Replaying the
+     * previous token can cross before the verifier snapshot in exact mode. */
+    if (resample && ds4_session_rewind_speculative(slot->session, pos)) {
+        pthread_mutex_unlock(&s->inference_mu);
+        return 0;
+    }
+    if (resample) pos--;
     ds4_session_rewind(slot->session, pos);
     ds4_tokens prefix = {0};
     ds4_tokens_copy(&prefix, ds4_session_tokens(slot->session));
@@ -12788,6 +12797,8 @@ static int server_generation_rewind(server *s, server_slot *slot,
     int rc = rebuild ? server_session_sync_multimodal(s, slot, &prefix,
         r->images, r->image_count, err, errlen) : 0;
     ds4_tokens_free(&prefix);
+    if (rc == 0 && resample)
+        rc = server_eval_token(s, slot, last_token, err, errlen);
     return rc;
 }
 
@@ -14430,16 +14441,17 @@ decode_again:
             }
         }
         if (kept < ntok && !text_stop && !job_cancelled(j) && strcmp(finish, "error")) {
-            /* Logits after a rewind belong to the discarded suffix. Re-eval
-             * the last kept token before sampling under a different mode. */
-            int pos = block_start + kept - (resample ? 1 : 0);
-            if (server_generation_rewind(s, slot, &j->req, pos, err, sizeof(err)) != 0 ||
-                (resample && server_eval_token(s, slot, toks[kept - 1], err, sizeof(err)) != 0)) {
+            int pos = block_start + kept;
+            const double rewind_t0 = now_sec();
+            trace_event(s, trace_id, "speculative boundary rewind: from=%d to=%d",
+                        ds4_session_pos(slot->session), pos);
+            if (server_generation_rewind(s, slot, &j->req, pos,
+                    resample, kept ? toks[kept - 1] : 0, err, sizeof(err)) != 0) {
                 finish = "error";
                 stop_decode = true;
             } else {
-                trace_event(s, trace_id, "speculative boundary: kept=%d discarded=%d resample=%d",
-                            kept, ntok - kept, resample);
+                trace_event(s, trace_id, "speculative boundary: kept=%d discarded=%d resample=%d rewind_ms=%.3f",
+                            kept, ntok - kept, resample, (now_sec() - rewind_t0) * 1000.0);
             }
         }
         if (stop_decode) break;
@@ -22919,6 +22931,54 @@ static void test_visible_image_key(void) {
     free(visible);
 }
 
+static void test_image_count_boundary(void) {
+    const size_t counts[] = {255, 256, 257};
+    for (size_t c = 0; c < sizeof(counts) / sizeof(counts[0]); c++) {
+        const size_t count = counts[c];
+        buf json = {0};
+        buf_puts(&json, "[{\"role\":\"user\",\"content\":[");
+        for (size_t i = 0; i < count; i++) {
+            if (i) buf_puts(&json, ",");
+            buf_puts(&json, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,");
+            buf_puts(&json, test_inline_png_base64);
+            buf_puts(&json, "\"}}");
+        }
+        buf_puts(&json, "]}]");
+        const char *cursor = json.ptr;
+        chat_msgs msgs = {0};
+        TEST_ASSERT(parse_messages(&cursor, &msgs));
+        TEST_ASSERT(msgs.len == 1 && msgs.v[0].images.len == count);
+        char (*markers)[SERVER_IMAGE_MARKER_BYTES] = xmalloc(count * sizeof(*markers));
+        for (size_t i = 0; i < count; i++)
+            memcpy(markers[i], msgs.v[0].images.v[i].marker, sizeof(markers[i]));
+        request req = {.image_count = count, .image_markers = markers,
+                       .prompt_text = msgs.v[0].content};
+        char error[256] = {0};
+        /* With no engine, admitted requests must reach the vision prerequisite;
+         * over-limit requests must fail before encoding or allocating embeddings. */
+        TEST_ASSERT(!request_tokenize_multimodal_prompt(NULL, NULL, &req,
+                                                       &msgs, error, sizeof(error)));
+        visible_image_key images;
+        char *key = visible_prompt_key(&req, req.prompt_text, &images);
+        if (count <= SERVER_MAX_IMAGES) {
+            TEST_ASSERT(strstr(error, "requires starting ds4-server") != NULL);
+            TEST_ASSERT(key && images.count == count);
+            if (key) {
+                visible_image_key changed = images;
+                changed.offsets[count - 1]++;
+                TEST_ASSERT(!visible_image_prefix_matches(&changed, &images, strlen(key)));
+            }
+        } else {
+            TEST_ASSERT(strstr(error, "at most 256 are allowed") != NULL);
+            TEST_ASSERT(key == NULL);
+        }
+        free(key);
+        free(markers);
+        chat_msgs_free(&msgs);
+        buf_free(&json);
+    }
+}
+
 static void test_anthropic_tool_image_output(void) {
     buf json = {0};
     buf_puts(&json, "[{\"content\":[{\"type\":\"tool_result\","
@@ -23214,6 +23274,7 @@ static void ds4_server_unit_tests_run(void) {
     test_deepseek41_anthropic_results();
     test_deepseek41_live_result_order();
     test_visible_image_key();
+    test_image_count_boundary();
     test_anthropic_tool_image_output();
     test_responses_tool_image_output();
     test_server_image_embedding_cache();
