@@ -2181,7 +2181,44 @@ extern "C" int ds4_gpu_dsv41_routed_moe_typed_tp_tensor(
             q, (const float *)x->ptr, 5120u, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "V4.1 MXFP4 TP input quantization");
     }
-    if (ok) {
+    const char *bulk_env = getenv("DS4_ROCM_V41_MXFP4_TP_BULK");
+    const bool bulk = n_tokens >= 128u && ds4_rocm_is_gfx1151() &&
+        (!bulk_env || !strcmp(bulk_env, "1"));
+    ds4_gpu_tensor *metadata = nullptr;
+    if (ok && bulk) {
+        /* Stable global-ID buckets preserve the caller's routing arrays.
+         * Remote expert tiles exit through null immutable table entries. */
+        const uint32_t capacity = routed_moe_expert_tile_capacity((uint32_t)pairs, 4u, experts);
+        const uint64_t words = 4u * (experts + 1u) + pairs + 1u + 2u * capacity;
+        metadata = ds4_gpu_tensor_alloc(words * sizeof(uint32_t));
+        if (!metadata) ok = 0;
+        if (ok) {
+            uint32_t *counts = (uint32_t *)metadata->ptr;
+            uint32_t *offsets = counts + experts + 1u;
+            uint32_t *cursors = offsets + experts + 1u;
+            uint32_t *tile_offsets = cursors + experts + 1u;
+            uint32_t *sorted = tile_offsets + experts + 1u;
+            uint32_t *total = sorted + pairs;
+            uint32_t *tile_experts = total + 1u;
+            uint32_t *starts = tile_experts + capacity;
+            ok = cuda_ok(cudaMemset(counts, 0, (experts + 1u) * sizeof(uint32_t)), "MXFP4 TP bucket clear");
+            for (ds4_gpu_tensor *target : {gate, up, mid})
+                if (ok) ok = cuda_ok(cudaMemset(target->ptr, 0, pairs * 2304u * sizeof(float)), "MXFP4 TP owned output clear");
+            if (ok) {
+                moe_count_sorted_pairs_kernel<<<(pairs + 255u) / 256u, 256u>>>(counts, (const int32_t *)selected->ptr, (uint32_t)pairs, experts);
+                moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, experts);
+                moe_scatter_sorted_pairs_deterministic_kernel<<<experts, 1>>>(sorted, offsets, (const int32_t *)selected->ptr, (uint32_t)pairs, experts);
+                moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile_offsets, total, counts, 4u, experts);
+                moe_build_expert_tiles_kernel<<<2, 256>>>(tile_experts, starts, tile_offsets, counts, 4u, experts);
+                moe_gate_up_mid_mxfp4_tp_tile4_qwarp32_kernel<4u><<<dim3(capacity, 288u), 256u, 4u * 20u * sizeof(cuda_block_q8_K)>>>(
+                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                    slots, slots + experts * sizeof(char *), q, sorted, offsets, counts,
+                    total, tile_experts, starts, (const float *)weights->ptr,
+                    gate_expert, gate_row, 20u, 2304u, used, 0u, 1u, 10.f);
+                ok = cuda_ok(cudaGetLastError(), "V4.1 MXFP4 TP owned tile4 qwarp32 gate/up");
+            }
+        }
+    } else if (ok) {
         moe_gate_up_mid_decode_mxfp4_qwarp32_kernel<true><<<dim3(288u, (uint32_t)pairs), 256u>>>(
             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
             slots, slots + experts * sizeof(char *), q,
@@ -2201,6 +2238,7 @@ extern "C" int ds4_gpu_dsv41_routed_moe_typed_tp_tensor(
         ok = cuda_ok(cudaGetLastError(), "V4.1 MXFP4 TP owned down");
     }
     if (!ds4_gpu_synchronize()) ok = 0;
+    ds4_gpu_tensor_free(metadata);
     ds4_gpu_tensor_free(table);
     return ok;
 }

@@ -3134,6 +3134,118 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     }
 }
 
+/* Unpack each owned half-block once, before processing its token cohort.
+ * Integer dot operands and FP scale/accumulation order match the native
+ * half-block helper; activation blocks retain their Q8_K representation. */
+struct dev_mxfp4_predecoded_half {
+    int32_t lo0, hi0, lo1, hi1;
+    float scale;
+};
+
+__device__ __forceinline__ static dev_mxfp4_predecoded_half
+        dev_mxfp4_predecode_half(const cuda_block_mxfp4 *x, uint32_t half) {
+    dev_mxfp4_predecoded_half w;
+    const uint8_t *q = x->qs + half * 8u;
+    dev_mxfp4_unpack2x4(q, &w.lo0, &w.hi0);
+    dev_mxfp4_unpack2x4(q + 4u, &w.lo1, &w.hi1);
+    w.scale = dev_e8m0_to_f32(x->e);
+    return w;
+}
+
+__device__ __forceinline__ static float dev_dot_mxfp4_predecoded_half_q8_K(
+        const dev_mxfp4_predecoded_half &w, const cuda_block_q8_K *y,
+        uint32_t subblock, uint32_t half) {
+    const uint32_t off = subblock * 32u + half * 8u;
+    const int8_t *lo = y->qs + off, *hi = lo + 16u;
+    int32_t bsum = 0;
+    bsum = __dp4a(w.lo0, *(const int32_t *)lo, bsum);
+    bsum = __dp4a(w.hi0, *(const int32_t *)hi, bsum);
+    bsum = __dp4a(w.lo1, *(const int32_t *)(lo + 4u), bsum);
+    bsum = __dp4a(w.hi1, *(const int32_t *)(hi + 4u), bsum);
+    return 0.5f * y->d * w.scale * (float)bsum;
+}
+
+/* Owned MXFP4 tiles retain the original per-row 32-lane dot/reduction
+ * order and share predecoded integer weights across four token rows. */
+template <uint32_t TILE_TOKENS>
+__global__ static void moe_gate_up_mid_mxfp4_tp_tile4_qwarp32_kernel(
+        float *gate_out, float *up_out, float *mid_out,
+        const char *gate_table, const char *up_table,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted_pairs, const uint32_t *offsets,
+        const uint32_t *counts, const uint32_t *tile_total,
+        const uint32_t *tile_experts, const uint32_t *tile_starts,
+        const float *weights, uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes, uint32_t xq_blocks,
+        uint32_t expert_mid_dim, uint32_t n_expert,
+        uint32_t max_count, uint32_t write_aux, float clamp) {
+    (void)gate_expert_bytes;
+    const uint32_t tile = blockIdx.x;
+    if (tile >= *tile_total) return;
+    const uint32_t expert = tile_experts[tile];
+    const char *gate_expert = ((const char *const *)gate_table)[expert];
+    const char *up_expert = ((const char *const *)up_table)[expert];
+    /* Expert ownership is uniform across the whole block, before barriers.
+     * The caller clears all unowned output slots before this launch. */
+    if (!gate_expert || !up_expert) return;
+    const uint32_t count = counts[expert];
+    if (max_count && count >= max_count) return;
+    const uint32_t start = tile_starts[tile];
+    const uint32_t np = min(count - start, TILE_TOKENS);
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row = blockIdx.y * 8u + (threadIdx.x >> 5u);
+    uint32_t pairs[TILE_TOKENS] = {};
+    #pragma unroll
+    for (uint32_t p = 0; p < TILE_TOKENS; ++p)
+        if (p < np) pairs[p] = sorted_pairs[offsets[expert] + start + p];
+    extern __shared__ cuda_block_q8_K staged[];
+    static_assert(sizeof(cuda_block_q8_K) % sizeof(uint32_t) == 0);
+    constexpr uint32_t words = sizeof(cuda_block_q8_K) / sizeof(uint32_t);
+    const uint32_t token_words = xq_blocks * words;
+    for (uint32_t i = threadIdx.x; i < np * token_words; i += blockDim.x) {
+        const uint32_t p = i / token_words;
+        const uint32_t word = i - p * token_words;
+        const uint32_t pair = sorted_pairs[offsets[expert] + start + p];
+        const uint32_t *source = (const uint32_t *)(xq +
+            (uint64_t)(pair / n_expert) * xq_blocks);
+        ((uint32_t *)staged)[i] = source[word];
+    }
+    __syncthreads();
+    if (row >= expert_mid_dim) return;
+    const auto *gb = (const cuda_block_mxfp4 *)(gate_expert + (uint64_t)row * gate_row_bytes);
+    const auto *ub = (const cuda_block_mxfp4 *)(up_expert + (uint64_t)row * gate_row_bytes);
+    float gate[TILE_TOKENS] = {}, up[TILE_TOKENS] = {};
+    const uint32_t block_lane = lane >> 1u, half = lane & 1u;
+    for (uint32_t mb = block_lane; mb < xq_blocks * 8u; mb += 16u) {
+        const auto gw = dev_mxfp4_predecode_half(gb + mb, half);
+        const auto uw = dev_mxfp4_predecode_half(ub + mb, half);
+        #pragma unroll
+        for (uint32_t p = 0; p < TILE_TOKENS; ++p) {
+            if (p >= np) continue;
+            const cuda_block_q8_K *yb = staged + p * xq_blocks + (mb >> 3u);
+            gate[p] += dev_dot_mxfp4_predecoded_half_q8_K(gw, yb, mb & 7u, half);
+            up[p] += dev_dot_mxfp4_predecoded_half_q8_K(uw, yb, mb & 7u, half);
+        }
+    }
+    #pragma unroll
+    for (uint32_t p = 0; p < TILE_TOKENS; ++p) {
+        if (p >= np) continue;
+        const float reduced_gate = warp_sum_f32(gate[p]);
+        const float reduced_up = warp_sum_f32(up[p]);
+        if (lane == 0u) {
+            float g = reduced_gate, u = reduced_up;
+            if (clamp > 1.0e-6f) {
+                if (g > clamp) g = clamp;
+                if (u > clamp) u = clamp;
+                if (u < -clamp) u = -clamp;
+            }
+            const uint64_t off = (uint64_t)pairs[p] * expert_mid_dim + row;
+            if (write_aux) { gate_out[off] = g; up_out[off] = u; }
+            mid_out[off] = (g / (1.0f + expf(-g))) * u * weights[pairs[p]];
+        }
+    }
+}
+
 template <bool Indirect = false>
 __global__ static void moe_gate_up_mid_decode_mxfp4_qwarp32_kernel(
         float *gate_out,
