@@ -6528,7 +6528,7 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     return 1;
 }
 
-/* Immutable small-row TP expert tables. The caller retains its final drain. */
+/* Immutable small-row TP expert tables. DSpark may defer successful cached work. */
 struct v41_tp_pointer_entry {
     const void *model;
     uint64_t model_size, gate_offset, up_offset, down_offset;
@@ -6537,7 +6537,24 @@ struct v41_tp_pointer_entry {
     void *table;
 };
 static std::vector<v41_tp_pointer_entry> g_v41_tp_pointer_cache;
+static bool g_v41_tp_pointer_cache_pending = false;
+static bool v41_tp_dspark_cache_async_enabled(bool dspark_step, uint32_t rows) {
+    if (!dspark_step || rows < 1u || rows > 6u || !ds4_rocm_is_gfx1151()) return false;
+    const char *enabled = getenv("DS4_ROCM_V41_TP_DSPARK_CACHE_ASYNC");
+    return enabled && !strcmp(enabled, "1");
+}
+static bool v41_tp_pointer_cache_may_defer(bool persistent_and_successful,
+                                         bool dspark_step, uint32_t rows) {
+    if (!persistent_and_successful ||
+        !v41_tp_dspark_cache_async_enabled(dspark_step, rows)) return false;
+    g_v41_tp_pointer_cache_pending = true;
+    return true;
+}
 static void v41_tp_pointer_cache_clear(void) {
+    if (g_v41_tp_pointer_cache_pending) {
+        (void)cuda_ok(cudaDeviceSynchronize(), "TP cached expert completion before release");
+        g_v41_tp_pointer_cache_pending = false;
+    }
     for (const auto &entry : g_v41_tp_pointer_cache) (void)cudaFree(entry.table);
     g_v41_tp_pointer_cache.clear();
 }

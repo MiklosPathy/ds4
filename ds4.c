@@ -42229,7 +42229,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         routed_ok = ds4_gpu_dsv41_routed_moe_tp_tensor(routed, g->gate, g->up, g->mid, g->experts,
                 m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                 l->ffn_down_exps->abs_offset, g->selected, g->route_weights,
-                g->norm, 1u, g->tp_rank, !g->draft && !g->dspark);
+                g->norm, 1u, g->tp_rank, !g->draft && !g->dspark, g->draft != NULL);
     } else
 #elif !defined(__APPLE__)
     if (g->tp_world == 2) {
@@ -42772,7 +42772,7 @@ static bool ds41_moe_batch_overlap(ds41_gpu_graph *g, const ds4_model *m,
         !ds4_gpu_dsv41_routed_moe_tp_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, b->selected, b->route_weights,
-            b->norm, count, g->tp_rank, !g->draft && !g->dspark)) return false;
+            b->norm, count, g->tp_rank, !g->draft && !g->dspark, false)) return false;
     if (!ds4_gpu_tp_big_gate_begin(il, count, b->routed, peer, bytes)) {
         ds4_gpu_tp_big_gate_abort();
         return false;
@@ -42821,7 +42821,8 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         ds4_gpu_dsv41_routed_moe_tp_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, b->selected, b->route_weights,
-            b->norm, count, g->tp_rank, !g->draft && !g->dspark) :
+            b->norm, count, g->tp_rank, !g->draft && !g->dspark,
+            g->draft && g->draft->verify_rows == count) :
 #elif !defined(__APPLE__)
         g->tp_world == 2 ?
         ds4_gpu_routed_moe_batch_owned_tensor(b->routed, b->gate, b->up, b->mid, b->experts,

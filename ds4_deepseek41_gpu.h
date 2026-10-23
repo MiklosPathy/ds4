@@ -206,7 +206,8 @@ int ds4_gpu_dsv41_f32_projection_rows(ds4_gpu_tensor *out,
                                      const ds4_gpu_tensor *in);
 /* V4.1 IQ2_XXS/Q2_K resident rank reference: global routing IDs, one
  * contiguous half of384 experts, and F32 partial output. The caller permits
- * pointer caching only for target sessions; DSpark always passes false. */
+ * pointer caching for target sessions; dspark_step separately admits the
+ * default-off DSpark cache/completion experiment for scalar/verification rows. */
 int ds4_gpu_dsv41_routed_moe_tp_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
         ds4_gpu_tensor *mid, ds4_gpu_tensor *scratch,
@@ -214,7 +215,7 @@ int ds4_gpu_dsv41_routed_moe_tp_tensor(
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t tp_rank,
-        bool allow_pointer_cache);
+        bool allow_pointer_cache, bool dspark_step);
 /* Bulk owned gate/up operator. Global routing is preserved; unowned output
  * rows are zero. The caller retains the weighted activation/down boundary. */
 int ds4_gpu_dsv41_moe_tp_gate_up(

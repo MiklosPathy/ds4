@@ -2005,7 +2005,7 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t tp_rank,
-        bool allow_pointer_cache) {
+        bool allow_pointer_cache, bool dspark_step) {
     constexpr uint32_t experts = 384u, owned = 192u, used = 6u;
     constexpr uint64_t gate_row = 1320u, down_row = 756u;
     constexpr uint64_t gate_expert = gate_row * 2304u, down_expert = down_row * 5120u;
@@ -2042,7 +2042,8 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
                                         owned * down_expert, "V4.1 TP owned down");
     if (!g || !u || !d) return 0;
     bool cache_failed = false;
-    const char *const *slots = allow_pointer_cache ?
+    const bool dspark_async = v41_tp_dspark_cache_async_enabled(dspark_step, n_tokens);
+    const char *const *slots = (allow_pointer_cache || dspark_async) ?
         v41_tp_pointer_cache_get(model_map, model_size, gate_offset, up_offset,
             down_offset, tp_rank, g, u, d, &cache_failed) : nullptr;
     if (cache_failed) return 0;
@@ -2107,8 +2108,20 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
             ok = cuda_ok(cudaGetLastError(), "V4.1 TP owned down");
         }
     }
-    /* Retain the reference drain in both modes; cache only immutable tables. */
-    if (!ds4_gpu_synchronize()) ok = 0;
+    /* Only opted-in DSpark keeps immutable tables past this return. Ordered
+     * consumers and TP arrival use the same stream; fallback/errors still drain. */
+    const bool deferred = v41_tp_pointer_cache_may_defer(ok && !table,
+        dspark_step, n_tokens);
+    if (!deferred && !ds4_gpu_synchronize()) ok = 0;
+    static bool traced[2][6] = {};
+    if (deferred && !traced[tp_rank][n_tokens - 1u]) {
+        const char *trace = getenv("DS4_ROCM_V41_TP_POINTER_CACHE_TRACE");
+        if (trace && !strcmp(trace, "1")) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "TP DSpark cache async model=deepseek41 rank=%u rows=%u persistent=1 deferred=1\n",
+                tp_rank, n_tokens);
+            traced[tp_rank][n_tokens - 1u] = true;
+        }
+    }
     ds4_gpu_tensor_free(table);
     return ok;
 }
