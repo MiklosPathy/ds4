@@ -35,6 +35,8 @@ struct ds4_tp_roce {
     uint64_t window_id;
     uint32_t lengths[TP_RC_WINDOW];
     unsigned posted;
+    bool inline_header;
+    bool early_receive, first_armed;
 };
 static void tp_roce_close(ds4_tp *tp) {
     struct ds4_tp_roce *r = tp->roce;
@@ -114,13 +116,34 @@ syserr:
 fail:
     tp_roce_close(tp); return 0;
 }
+/* A single bounded staging receive may complete before the next gate begins.
+ * Its payload stays private until that gate validates length and full header.
+ * Arm only after the previous payload has been copied out and CQ drained. */
+static int tp_roce_arm_first(ds4_tp *tp) {
+    struct ds4_tp_roce *r=tp->roce;
+    if (!r->early_receive) return 1;
+    if (r->first_armed || r->posted || r->window_id>=UINT64_MAX/16u || ds4_tp_failed(tp)) {
+        errno=EINVAL; return 0;
+    }
+    struct ibv_sge sg={.addr=(uintptr_t)r->rx,.length=TP_RC_CHUNK,.lkey=r->rx_mr->lkey};
+    struct ibv_recv_wr wr={.wr_id=(r->window_id+1u)*16u,.sg_list=&sg,.num_sge=1},*bad=NULL;
+    if (ibv_post_recv(r->qp,&wr,&bad)) return 0;
+    r->first_armed=true;
+    return 1;
+}
 static int tp_roce_connect(ds4_tp *tp,char *err,size_t errlen) {
     struct ds4_tp_roce *r=tp->roce;
     struct { uint64_t epoch; uint32_t qpn,psn,mtu; uint8_t gid[16]; uint32_t reserved; } mine={0},peer={0};
+    const char *inline_env=getenv("DS4_TP_ROCE_INLINE_HEADER");
+    r->inline_header=inline_env && !strcmp(inline_env,"1");
+    const char *early_env=getenv("DS4_TP_ROCE_EARLY_RECEIVE");
+    r->early_receive=early_env && !strcmp(early_env,"1");
+    if(r->early_receive && !r->inline_header) { errno=EINVAL; goto fail; }
+    mine.reserved=(r->inline_header?1u:0u)|(r->early_receive?2u:0u);
     mine.epoch=tp->epoch;mine.qpn=r->qp->qp_num;mine.psn=r->psn;mine.mtu=r->mtu;memcpy(mine.gid,&r->gid,16);
     if(!ds4_tp_io_exchange(tp->data_fd,&mine,&peer,sizeof(mine),tp->gate_timeout_ms,&tp->failed)) goto fail;
     if(peer.epoch!=mine.epoch || !peer.qpn || peer.qpn>0xffffffu || peer.psn>0xffffffu ||
-       peer.mtu<IBV_MTU_256 || peer.mtu>IBV_MTU_4096 || peer.reserved) { errno=EPROTO; goto fail; }
+       peer.mtu<IBV_MTU_256 || peer.mtu>IBV_MTU_4096 || peer.reserved!=mine.reserved) { errno=EPROTO; goto fail; }
     const uint8_t port=tp->opt.rdma_port?tp->opt.rdma_port:1;
     struct ibv_qp_attr a={0};
     a.qp_state=IBV_QPS_RTR;a.path_mtu=peer.mtu<(uint32_t)r->mtu?(enum ibv_mtu)peer.mtu:r->mtu;
@@ -128,8 +151,13 @@ static int tp_roce_connect(ds4_tp *tp,char *err,size_t errlen) {
     a.ah_attr.is_global=1;a.ah_attr.port_num=port;memcpy(&a.ah_attr.grh.dgid,peer.gid,16);
     a.ah_attr.grh.sgid_index=tp->opt.rdma_gid_index;a.ah_attr.grh.hop_limit=64;
     if(r->modify_qp(r->qp,&a,IBV_QP_STATE|IBV_QP_AV|IBV_QP_PATH_MTU|IBV_QP_DEST_QPN|IBV_QP_RQ_PSN|IBV_QP_MAX_DEST_RD_ATOMIC|IBV_QP_MIN_RNR_TIMER)) goto fail;
-    memset(&a,0,sizeof(a));a.qp_state=IBV_QPS_RTS;a.sq_psn=r->psn;a.timeout=14;a.retry_cnt=3;a.rnr_retry=3;a.max_rd_atomic=1;
+    memset(&a,0,sizeof(a));a.qp_state=IBV_QPS_RTS;a.sq_psn=r->psn;a.timeout=14;a.retry_cnt=r->inline_header?7:3;/* A peer can still be computing when the inline frame is sent.
+     * The software gate deadline bounds retry/cancellation; QP destruction
+     * ends outstanding DMA before registered buffers are released. */
+    a.rnr_retry=r->inline_header?7:3;a.max_rd_atomic=1;
     if(r->modify_qp(r->qp,&a,IBV_QP_STATE|IBV_QP_SQ_PSN|IBV_QP_TIMEOUT|IBV_QP_RETRY_CNT|IBV_QP_RNR_RETRY|IBV_QP_MAX_QP_RD_ATOMIC)) goto fail;
+    if(!tp_roce_arm_first(tp)) goto fail;
+    fprintf(stderr,"ds4-tp: RoCE inline-header=%u early-receive=%u\n",r->inline_header,r->early_receive);
     fprintf(stderr,"ds4-tp: RoCE RC device=%s port=%u gid-index=%d window=%u chunk=%u host-staging=%uMiB\n",tp->opt.rdma_device,port,tp->opt.rdma_gid_index,TP_RC_WINDOW,TP_RC_CHUNK,2*TP_RC_WINDOW*TP_RC_CHUNK/(1024*1024));
     return 1;
 fail:
@@ -140,18 +168,21 @@ fail:
 static int tp_roce_prepare(ds4_tp *tp,uint64_t bytes) {
     struct ds4_tp_roce *r=tp->roce;
     if(r->posted || !bytes || r->window_id>=UINT64_MAX/16u) { errno=EINVAL; return 0; }
+    const bool armed=r->first_armed;
+    r->first_armed=false;
     ++r->window_id;
     for(unsigned i=0;i<TP_RC_WINDOW && bytes;i++) {
         uint32_t n=bytes>TP_RC_CHUNK?TP_RC_CHUNK:(uint32_t)bytes;
         r->lengths[i]=n;
         struct ibv_sge sg={.addr=(uintptr_t)(r->rx+i*TP_RC_CHUNK),.length=n,.lkey=r->rx_mr->lkey};
         struct ibv_recv_wr wr={.wr_id=r->window_id*16u+i,.sg_list=&sg,.num_sge=1},*bad=NULL;
-        if(ibv_post_recv(r->qp,&wr,&bad)) return 0;
+        if(!(armed && i==0) && ibv_post_recv(r->qp,&wr,&bad)) return 0;
         r->posted++;bytes-=n;
     }
     return 1;
 }
-static int tp_roce_exchange(ds4_tp *tp,const void *out,void *in,uint64_t bytes) {
+static int tp_roce_exchange_frame(ds4_tp *tp,const void *out,void *in,uint64_t bytes,
+                                  const void *header,uint32_t header_bytes) {
     struct ds4_tp_roce *r=tp->roce;
     const double deadline=tp_now_sec()+(double)tp->gate_timeout_ms/1000.0;
     uint64_t offset=0;
@@ -160,7 +191,11 @@ static int tp_roce_exchange(ds4_tp *tp,const void *out,void *in,uint64_t bytes) 
         if(!nr) { errno=EPROTO; return 0; }
         uint64_t covered=0;
         for(unsigned i=0;i<nr;i++) {
-            memcpy(r->tx+i*TP_RC_CHUNK,(const uint8_t*)out+offset+covered,r->lengths[i]);
+            const uint64_t at=offset+covered;
+            const uint32_t prefix=at<header_bytes ? header_bytes-(uint32_t)at : 0;
+            if(prefix>r->lengths[i]) { errno=EPROTO;return 0; }
+            if(prefix) memcpy(r->tx+i*TP_RC_CHUNK,(const uint8_t*)header+at,prefix);
+            memcpy(r->tx+i*TP_RC_CHUNK+prefix,(const uint8_t*)out+at+prefix-header_bytes,r->lengths[i]-prefix);
             struct ibv_sge sg={.addr=(uintptr_t)(r->tx+i*TP_RC_CHUNK),.length=r->lengths[i],.lkey=r->tx_mr->lkey};
             struct ibv_send_wr wr={.wr_id=r->window_id*16u+8u+i,.sg_list=&sg,.num_sge=1,.opcode=IBV_WR_SEND,.send_flags=IBV_SEND_SIGNALED},*bad=NULL;
             if(ibv_post_send(r->qp,&wr,&bad)) return 0;
@@ -186,8 +221,15 @@ static int tp_roce_exchange(ds4_tp *tp,const void *out,void *in,uint64_t bytes) 
             }
         }
         atomic_thread_fence(memory_order_acquire);
+        /* Validate the complete first-frame header before exposing payload. */
+        if(!offset && header_bytes && memcmp(r->rx,header,header_bytes)) { errno=EPROTO;return 0; }
         covered=0;
-        for(unsigned i=0;i<nr;i++) { memcpy((uint8_t*)in+offset+covered,r->rx+i*TP_RC_CHUNK,r->lengths[i]);covered+=r->lengths[i]; }
+        for(unsigned i=0;i<nr;i++) {
+            const uint64_t at=offset+covered;
+            const uint32_t prefix=at<header_bytes ? header_bytes-(uint32_t)at : 0;
+            memcpy((uint8_t*)in+at+prefix-header_bytes,r->rx+i*TP_RC_CHUNK+prefix,r->lengths[i]-prefix);
+            covered+=r->lengths[i];
+        }
         r->posted=0;offset+=covered;
         if(offset<bytes) {
             if(!tp_roce_prepare(tp,bytes-offset)) return 0;
@@ -196,7 +238,18 @@ static int tp_roce_exchange(ds4_tp *tp,const void *out,void *in,uint64_t bytes) 
             if(remaining<1 || !ds4_tp_io_exchange(tp->data_fd,mine,peer,sizeof(mine),(uint64_t)remaining,&tp->failed) || memcmp(mine,peer,sizeof(mine))) return 0;
         }
     }
-    return 1;
+    return tp_roce_arm_first(tp);
+}
+static int tp_roce_exchange(ds4_tp *tp,const void *out,void *in,uint64_t bytes) {
+    return tp_roce_exchange_frame(tp,out,in,bytes,NULL,0);
+}
+static int tp_roce_inline_enabled(ds4_tp *tp) { return tp->roce && tp->roce->inline_header; }
+static int tp_roce_inline_exchange(ds4_tp *tp,const void *header,uint32_t header_bytes,
+                                   const void *out,void *in,uint64_t bytes) {
+    if(!header || !header_bytes || header_bytes>TP_RC_CHUNK || bytes>UINT64_MAX-header_bytes) { errno=EINVAL;return 0; }
+    const uint64_t wire_bytes=bytes+header_bytes;
+    if(!tp_roce_prepare(tp,wire_bytes)) return 0;
+    return tp_roce_exchange_frame(tp,out,in,wire_bytes,header,header_bytes);
 }
 #else
 static void tp_roce_close(ds4_tp *tp) { (void)tp; }
@@ -206,4 +259,9 @@ static int tp_roce_probe(ds4_tp *tp,char *err,size_t errlen) {
 static int tp_roce_connect(ds4_tp *tp,char *err,size_t errlen) { (void)tp;(void)err;(void)errlen;return 0; }
 static int tp_roce_prepare(ds4_tp *tp,uint64_t bytes) { (void)tp;(void)bytes;return 0; }
 static int tp_roce_exchange(ds4_tp *tp,const void *out,void *in,uint64_t bytes) { (void)tp;(void)out;(void)in;(void)bytes;return 0; }
+static int tp_roce_inline_enabled(ds4_tp *tp) { (void)tp;return 0; }
+static int tp_roce_inline_exchange(ds4_tp *tp,const void *header,uint32_t header_bytes,
+                                   const void *out,void *in,uint64_t bytes) {
+    (void)tp;(void)header;(void)header_bytes;(void)out;(void)in;(void)bytes;return 0;
+}
 #endif

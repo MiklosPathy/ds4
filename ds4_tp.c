@@ -2756,9 +2756,13 @@ static int tp_linux_gate(ds4_tp *tp, uint32_t kind, uint32_t layer,
         errno = EINVAL;
         goto fail;
     }
-    if (tp->rdma_active && !tp_roce_prepare(tp, bytes)) goto fail;
     ds4_tp_linux_gate_header h = {DS4_TP_MAGIC, kind, layer, gate,
                                   tp->epoch, seq, bytes}, peer;
+    if (tp->rdma_active && tp_roce_inline_enabled(tp) && !grace_ms) {
+        if (!tp_roce_inline_exchange(tp,&h,sizeof(h),out,in,bytes)) goto fail;
+        return 1;
+    }
+    if (tp->rdma_active && !tp_roce_prepare(tp, bytes)) goto fail;
     if (!ds4_tp_io_exchange(tp->data_fd, &h, &peer, sizeof(h),
                            tp->gate_timeout_ms + grace_ms, &tp->failed)) goto fail;
     if (memcmp(&h, &peer, sizeof(h))) { errno = EPROTO; goto fail; }
