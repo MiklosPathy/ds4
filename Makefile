@@ -1153,6 +1153,13 @@ tests/test_deepseek41_tp_moe_rocm.o: tests/test_deepseek41_tp_moe_rocm.c ds4_gpu
 ds4-kernel-v41-tp-moe: tests/test_deepseek41_tp_moe_rocm.o ds4_rocm.o ds4_image.rocm.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
+tests/test_deepseek41_mxfp4_tp_rocm.o: tests/test_deepseek41_mxfp4_tp_rocm.c ds4_gpu.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -ffp-contract=off $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+ds4-kernel-v41-mxfp4-tp: tests/test_deepseek41_mxfp4_tp_rocm.o ds4_rocm.o ds4_image.rocm.o tests/test_rocm_engine_stub.o $(ROCM_MMQ_OBJS) $(ROCM_HALO_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+
 tests/test_rocm_tp_bind_failure.o: tests/test_rocm_tp_bind_failure.c ds4.c ds4.h ds4_gpu.h ds4_tp.h ds4_deepseek41_gpu.h ds4_gpu_tp.h
 	$(CC) $(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD -ffunction-sections -fdata-sections -I. -c -o $@ $<
 
@@ -1528,6 +1535,7 @@ clean:
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm tests/test_cuda_tokentile
 	rm -f tests/test_ssd_cache tests/test_engram
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands tests/test_tp_linux
+	rm -f ds4-kernel-v41-mxfp4-tp
 	rm -f ds4-kernel-v41-tp-bind-failure ds4-kernel-v41-tp-attention ds4-kernel-v41-attention-gufo ds4-kernel-v41-tp-moe ds4-kernel-v41-tp-gates ds4-kernel-v41-tp-mmq ds4-kernel-v41-tp-down
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp
 	rm -f tests/test_deepseek_indexer tests/test_cuda_tp_link
@@ -1636,3 +1644,7 @@ gguf-tools/quality-testing/score_official_verify.o: gguf-tools/quality-testing/s
 
 gguf-tools/quality-testing/score_official_verify: gguf-tools/quality-testing/score_official_verify.o ds4_verify_test_hooks.o $(filter-out ds4.o,$(CORE_OBJS)) rax.o ds4_gpu_args.o
 	$(if $(filter Darwin,$(UNAME_S)),$(CC) $(CFLAGS),$(DS4_LINK)) -o $@ $^ $(if $(filter Darwin,$(UNAME_S)),$(METAL_LDLIBS),$(DS4_LINK_LIBS))
+
+.PHONY: test-deepseek41-join
+test-deepseek41-join:
+	python3 tests/test_deepseek41_join.py

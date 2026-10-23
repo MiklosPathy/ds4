@@ -216,6 +216,16 @@ int ds4_gpu_dsv41_routed_moe_tp_tensor(
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t tp_rank,
         bool allow_pointer_cache, bool dspark_step);
+/* Typed dispatch preserves Q2 specialization and admits native MXFP4 experts. */
+int ds4_gpu_dsv41_routed_moe_typed_tp_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *scratch,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t tp_rank,
+        uint32_t gate_type, uint32_t down_type,
+        bool allow_pointer_cache, bool dspark_step);
 /* Bulk owned gate/up operator. Global routing is preserved; unowned output
  * rows are zero. The caller retains the weighted activation/down boundary. */
 int ds4_gpu_dsv41_moe_tp_gate_up(

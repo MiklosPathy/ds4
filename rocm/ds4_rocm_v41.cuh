@@ -2126,6 +2126,85 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
     return ok;
 }
 
+/* Native MXFP4 uses the same quantized activation/reduction primitives as
+ * resident dispatch. Null global-ID entries prevent every unowned load. */
+extern "C" int ds4_gpu_dsv41_routed_moe_typed_tp_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *scratch,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t tp_rank,
+        uint32_t gate_type, uint32_t down_type,
+        bool allow_pointer_cache, bool dspark_step) {
+    if (gate_type == 16u && down_type == 10u)
+        return ds4_gpu_dsv41_routed_moe_tp_tensor(out, gate, up, mid, scratch,
+            model_map, model_size, gate_offset, up_offset, down_offset,
+            selected, weights, x, n_tokens, tp_rank, allow_pointer_cache, dspark_step);
+    constexpr uint32_t experts = 384u, owned = 192u, used = 6u;
+    constexpr uint64_t gate_row = 2720u, down_row = 1224u;
+    constexpr uint64_t gate_expert = gate_row * 2304u, down_expert = down_row * 5120u;
+    routed_moe_launch_plan plan;
+    if (gate_type != 39u || down_type != 39u || !g_deepseek41_model ||
+        tp_rank > 1u || !n_tokens || n_tokens > 2048u ||
+        !routed_moe_build_plan(out, gate, up, mid, scratch, model_map, model_size,
+            gate_offset, up_offset, down_offset, 39u, 39u, gate_expert, down_expert,
+            5120u, 2304u, 5120u, selected, weights, experts, used, x, n_tokens, &plan)) return 0;
+    const uint64_t pairs = (uint64_t)n_tokens * used;
+    std::vector<int32_t> ids((size_t)pairs);
+    if (!ds4_gpu_tensor_read(selected, 0, ids.data(), pairs * sizeof(int32_t))) return 0;
+    for (int32_t id : ids) if (id < 0 || (uint32_t)id >= experts) {
+        fprintf(stderr, "ds4: V4.1 MXFP4 TP invalid global expert ID %d\n", id);
+        return 0;
+    }
+    const uint32_t first = tp_rank * owned;
+    const char *g = cuda_model_range_ptr(model_map, gate_offset + first * gate_expert,
+                                        owned * gate_expert, "V4.1 MXFP4 TP owned gate");
+    const char *u = cuda_model_range_ptr(model_map, up_offset + first * gate_expert,
+                                        owned * gate_expert, "V4.1 MXFP4 TP owned up");
+    const char *d = cuda_model_range_ptr(model_map, down_offset + first * down_expert,
+                                        owned * down_expert, "V4.1 MXFP4 TP owned down");
+    if (!g || !u || !d) return 0;
+    const char *tables[3][experts] = {};
+    for (uint32_t i = 0; i < owned; ++i) {
+        tables[0][first+i] = g + i * gate_expert;
+        tables[1][first+i] = u + i * gate_expert;
+        tables[2][first+i] = d + i * down_expert;
+    }
+    ds4_gpu_tensor *table = ds4_gpu_tensor_alloc(sizeof(tables));
+    if (!table) return 0;
+    int ok = ds4_gpu_tensor_write(table, 0, tables, sizeof(tables));
+    const char *slots = (const char *)table->ptr;
+    cuda_block_q8_K *q = (cuda_block_q8_K *)scratch->ptr;
+    if (ok) {
+        q8_K_quantize_kernel<<<dim3(20u, n_tokens), 256u>>>(
+            q, (const float *)x->ptr, 5120u, n_tokens);
+        ok = cuda_ok(cudaGetLastError(), "V4.1 MXFP4 TP input quantization");
+    }
+    if (ok) {
+        moe_gate_up_mid_decode_mxfp4_qwarp32_kernel<true><<<dim3(288u, (uint32_t)pairs), 256u>>>(
+            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+            slots, slots + experts * sizeof(char *), q,
+            (const int32_t *)selected->ptr, (const float *)weights->ptr,
+            gate_expert, gate_row, 20u, 2304u, used, 1u, 10.f);
+        ok = cuda_ok(cudaGetLastError(), "V4.1 MXFP4 TP owned gate/up");
+    }
+    if (ok) {
+        q8_K_quantize_kernel<<<dim3(9u, (uint32_t)pairs), 256u>>>(
+            q, (const float *)mid->ptr, 2304u, (uint32_t)pairs);
+        ok = cuda_ok(cudaGetLastError(), "V4.1 MXFP4 TP mid quantization");
+    }
+    if (ok) {
+        moe_down_mxfp4_sum6_qwarp32_kernel<true, true><<<dim3(640u, n_tokens), 256u>>>(
+            (float *)out->ptr, slots + 2u * experts * sizeof(char *), q,
+            (const int32_t *)selected->ptr, down_expert, down_row, 9u, 5120u, used);
+        ok = cuda_ok(cudaGetLastError(), "V4.1 MXFP4 TP owned down");
+    }
+    if (!ds4_gpu_synchronize()) ok = 0;
+    ds4_gpu_tensor_free(table);
+    return ok;
+}
+
 /* Staged ownership adapter for the unchanged qualified Q2 down dispatcher.
  * Pair order is stable within each local expert, as in its GPU sort. */
 extern "C" int ds4_gpu_dsv41_moe_tp_down(

@@ -145,6 +145,18 @@ static int run(unsigned n,unsigned rank,unsigned mode) {
     }
     RUN(ds4_gpu_dsv41_routed_moe_tp_tensor(ot,gt,ut,mt,dt,model,wb,0,table,2*table,it,wt,xt,n,rank,false,false));
     CHECK(ds4_gpu_tensor_read(ot,0,got,ny*4));
+    if(mode==7) {
+        /* The typed Q2 adapter promises identical dispatch/arithmetic. Compare
+         * it directly at production precision, including Q8_K mid rounding. */
+        ds4_gpu_tensor *typed=upload(NULL,ny*4);float *again=malloc(ny*4);
+        CHECK(typed&&again);
+        RUN(ds4_gpu_dsv41_routed_moe_typed_tp_tensor(typed,gt,ut,mt,dt,model,wb,
+            0,table,2*table,it,wt,xt,n,rank,16u,10u,false,false));
+        CHECK(ds4_gpu_tensor_read(typed,0,again,ny*4));
+        CHECK(!memcmp(got,again,ny*4)&&sync_guards());
+        ds4_gpu_tensor_free(typed);free(again);
+        puts("Typed Q2 dispatch full-output bit parity PASS");goto cleanup;
+    }
     if(mode==6)got[0]+=1.f; /* Deliberate oracle corruption must fail. */
     size_t failures=0;double worst=0;
     if(n>=128) {
@@ -224,7 +236,7 @@ cleanup:
 int main(int argc,char **argv) {
     if(argc!=4)return 2;
     unsigned n=strtoul(argv[1],NULL,10),rank=strtoul(argv[2],NULL,10),mode=strtoul(argv[3],NULL,10);
-    if(!n||n>2048||rank>1||mode>6)return 2;
+    if(!n||n>2048||rank>1||mode>7)return 2;
     fprintf(stderr,"PID=%ld rows=%u rank=%u route-mode=%u\n",(long)getpid(),n,rank,mode);
     if(!ds4_gpu_init()||!run(n,rank,mode))return 1;
     puts("TP MoE case PASS");return 0;

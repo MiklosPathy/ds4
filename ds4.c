@@ -2795,12 +2795,17 @@ static void model_unmap_engram(ds4_model *m) {
     if (!tables[0] || !tables[1]) ds4_die("V4.1 GGUF is missing Engram tables");
     const uint64_t start = tables[0]->abs_offset;
     const long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0 || start % (uint64_t)page || resident_end > start ||
+    /* Split GGUFs can place a table inside its first page. Reflink joining
+     * retains that offset: discard the preceding unused padding too, only
+     * after proving the last resident tensor ends before this whole page. */
+    if (page <= 0) ds4_die("cannot determine Engram mapping page size");
+    const uint64_t unmap_start = start - start % (uint64_t)page;
+    if (resident_end > unmap_start ||
         tables[1]->abs_offset < start + tables[0]->bytes)
         ds4_die("V4.1 Engram tables must follow the page-aligned main weights");
-    if (munmap((void *)(m->map + start), (size_t)(m->size - start)) != 0)
+    if (munmap((void *)(m->map + unmap_start), (size_t)(m->size - unmap_start)) != 0)
         ds4_die_errno("cannot unmap disk-only region", "Engram");
-    m->size = start;
+    m->size = unmap_start;
 }
 
 #ifdef DS4_ROCM_BUILD
@@ -42096,7 +42101,7 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 #ifdef DS4_ROCM_BUILD
-/* The first ROCm streaming path uses one uniform Q2 expert size class. */
+/* Each ROCm streaming model uses one uniform Q2 or native MXFP4 size class. */
 static bool ds41_stream_table(const ds4_model *m, const ds4_layer_weights *l,
                               uint32_t il, ds4_gpu_stream_expert_table *table) {
     if (!m || !l || !table || il >= DS4_N_LAYER ||
@@ -42104,9 +42109,12 @@ static bool ds41_stream_table(const ds4_model *m, const ds4_layer_weights *l,
         DS4_N_EXPERT != 384u || DS4_N_EXPERT_USED != 6u ||
         !l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) return false;
     const ds4_tensor *t[] = {l->ffn_gate_exps, l->ffn_up_exps, l->ffn_down_exps};
+    const bool mxfp4 = t[0]->type == DS4_TENSOR_MXFP4;
     for (uint32_t i = 0; i < 3; i++) {
         uint64_t bytes = 0;
-        if (t[i]->type != (i == 2 ? DS4_TENSOR_Q2_K : DS4_TENSOR_IQ2_XXS) ||
+        const uint32_t kind = mxfp4 ? DS4_TENSOR_MXFP4 :
+            (i == 2 ? DS4_TENSOR_Q2_K : DS4_TENSOR_IQ2_XXS);
+        if (t[i]->type != kind ||
             t[i]->ndim != 3 || t[i]->dim[0] != (i == 2 ? DS4_N_FF_EXP : DS4_N_EMBD) ||
             t[i]->dim[1] != (i == 2 ? DS4_N_EMBD : DS4_N_FF_EXP) ||
             t[i]->dim[2] != DS4_N_EXPERT ||
@@ -42226,10 +42234,10 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     bool routed_ok;
 #ifdef DS4_ROCM_BUILD
     if (g->tp_world == 2u) {
-        routed_ok = ds4_gpu_dsv41_routed_moe_tp_tensor(routed, g->gate, g->up, g->mid, g->experts,
+        routed_ok = ds4_gpu_dsv41_routed_moe_typed_tp_tensor(routed, g->gate, g->up, g->mid, g->experts,
                 m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                 l->ffn_down_exps->abs_offset, g->selected, g->route_weights,
-                g->norm, 1u, g->tp_rank, !g->draft && !g->dspark, g->draft != NULL);
+                g->norm, 1u, g->tp_rank, l->ffn_gate_exps->type, l->ffn_down_exps->type, !g->draft && !g->dspark, g->draft != NULL);
     } else
 #elif !defined(__APPLE__)
     if (g->tp_world == 2) {
@@ -42769,10 +42777,10 @@ static bool ds41_moe_batch_overlap(ds41_gpu_graph *g, const ds4_model *m,
     const uint64_t bytes = (uint64_t)count * DS4_N_EMBD * sizeof(float);
     if (!ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) ||
         !ds41_route_batch(g, m, l, count) ||
-        !ds4_gpu_dsv41_routed_moe_tp_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+        !ds4_gpu_dsv41_routed_moe_typed_tp_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, b->selected, b->route_weights,
-            b->norm, count, g->tp_rank, !g->draft && !g->dspark, false)) return false;
+            b->norm, count, g->tp_rank, l->ffn_gate_exps->type, l->ffn_down_exps->type, !g->draft && !g->dspark, false)) return false;
     if (!ds4_gpu_tp_big_gate_begin(il, count, b->routed, peer, bytes)) {
         ds4_gpu_tp_big_gate_abort();
         return false;
@@ -42818,11 +42826,11 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         (
 #ifdef DS4_ROCM_BUILD
         g->tp_world == 2u ?
-        ds4_gpu_dsv41_routed_moe_tp_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+        ds4_gpu_dsv41_routed_moe_typed_tp_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, b->selected, b->route_weights,
-            b->norm, count, g->tp_rank, !g->draft && !g->dspark,
-            g->draft && g->draft->verify_rows == count) :
+            b->norm, count, g->tp_rank, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+            !g->draft && !g->dspark, g->draft && g->draft->verify_rows == count) :
 #elif !defined(__APPLE__)
         g->tp_world == 2 ?
         ds4_gpu_routed_moe_batch_owned_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
@@ -71345,7 +71353,7 @@ static bool ds41_stream_cache_configure(ds4_engine *e) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_stream_expert_table table;
         if (!ds41_stream_table(&e->model, &e->weights.layer[il], il, &table)) {
-            fprintf(stderr, "ds4: V4.1 ROCm SSD streaming requires uniform IQ2_XXS/Q2_K experts (layer %u)\n", il);
+            fprintf(stderr, "ds4: V4.1 ROCm SSD streaming requires uniform IQ2_XXS/Q2_K or MXFP4 experts (layer %u)\n", il);
             return false;
         }
         const uint64_t bytes = 2u * table.gate_expert_bytes + table.down_expert_bytes;
@@ -74145,12 +74153,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->tp.role != DS4_TP_NONE) {
         for (uint32_t il = 0; il < DS4_N_LAYER; ++il) {
             const ds4_layer_weights *l = &e->weights.layer[il];
-            if (l->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
-                l->ffn_up_exps->type != DS4_TENSOR_IQ2_XXS ||
-                l->ffn_down_exps->type != DS4_TENSOR_Q2_K ||
+            const bool q2 = l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+                l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+                l->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+            const bool mxfp4 = l->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
+                l->ffn_up_exps->type == DS4_TENSOR_MXFP4 &&
+                l->ffn_down_exps->type == DS4_TENSOR_MXFP4;
+            if ((!q2 && !mxfp4) ||
                 l->attn_output_a->type != DS4_TENSOR_Q8_0 ||
                 l->attn_output_b->type != DS4_TENSOR_Q8_0) {
-                fprintf(stderr, "ds4: V4.1 ROCm TP requires IQ2_XXS gate/up, Q2_K down and Q8_0 attention output weights (layer %u)\n", il);
+                fprintf(stderr, "ds4: V4.1 ROCm TP requires IQ2_XXS/Q2_K or MXFP4 experts and Q8_0 attention output weights (layer %u)\n", il);
                 ds4_engine_close(e); *out = NULL; return 1;
             }
         }
