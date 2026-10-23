@@ -41343,6 +41343,46 @@ static uint64_t ds41_graph_bytes(uint32_t ctx) {
     return floats * sizeof(float) + sizeof(*g) + (uint64_t)DS4_N_VOCAB * 4u + packed + sort;
 }
 
+#ifdef DS4_ROCM_BUILD
+/* Declared accounting stays CPU-only, including before GPU initialization.
+ * An unsupported GPU may conservatively reserve the requested F32 cache. */
+static uint64_t ds41_draft_markov_head_bytes(const ds4_tensor *head,
+                                             uint32_t rank) {
+    if (!head) return 0;
+    if (head->type == DS4_TENSOR_F16)
+        return (uint64_t)DS4_N_VOCAB * rank * sizeof(uint16_t);
+    const char *env = getenv("DS4_ROCM_V41_MARKOV_F32_TRANSPOSE");
+    if (head->type == DS4_TENSOR_F32 && DS4_N_VOCAB == 129280u &&
+        rank == 256u && (!env || strcmp(env, "1") == 0))
+        return (uint64_t)DS4_N_VOCAB * rank * sizeof(float);
+    return 0;
+}
+
+static bool ds41_draft_prepare_markov_head(ds41_draft *d,
+                                          const ds4_model *dm,
+                                          const ds4_tensor *head) {
+    const uint64_t bytes = ds41_draft_markov_head_bytes(head, d->rank);
+    if (!bytes) return true;
+    if (head->type == DS4_TENSOR_F32) {
+        if (!ds4_gpu_dsv41_markov_f32_head_available()) return true;
+        const ds4_tensor *embed = d->w->stage[d->n_stage - 1u].markov_w1;
+        if (!embed || embed->type != DS4_TENSOR_F32 || embed->bytes < bytes)
+            return false;
+    }
+    if (head->bytes < bytes ||
+        !(d->markov_head_t = ds4_gpu_tensor_alloc(bytes))) return false;
+    if (head->type == DS4_TENSOR_F16)
+        return ds4_gpu_dsv41_markov_prepare_head(d->markov_head_t,
+            dm->map, dm->size, head->abs_offset, DS4_N_VOCAB, d->rank) != 0;
+    if (!ds4_gpu_dsv41_markov_prepare_head_f32(d->markov_head_t,
+            dm->map, dm->size, head->abs_offset, DS4_N_VOCAB, d->rank)) return false;
+    fprintf(stderr, "ds4: ROCm F32 Markov head transpose %llu bytes\n",
+            (unsigned long long)bytes);
+    return true;
+}
+
+#endif
+
 static uint64_t ds41_draft_bytes(const ds4_dspark_weights *dw) {
     if (!dw || !dw->n_stages || dw->n_stages > DS4_DSPARK_MAX_STAGES ||
         !dw->block_size || dw->block_size > DS4_DSPARK_MAX_BLOCK_SIZE ||
@@ -41375,9 +41415,13 @@ static uint64_t ds41_draft_bytes(const ds4_dspark_weights *dw) {
     DS41_DRAFT_ADD(2u * win * dim, sizeof(float));
     const ds4_tensor *markov_head =
         dw->stage[dw->n_stages - 1u].markov_w2;
+#ifdef DS4_ROCM_BUILD
+    DS41_DRAFT_ADD(1u, ds41_draft_markov_head_bytes(markov_head, dw->markov_rank));
+#else
     if (markov_head && markov_head->type == DS4_TENSOR_F16)
         DS41_DRAFT_ADD((uint64_t)DS4_N_VOCAB * dw->markov_rank,
                        sizeof(uint16_t));
+#endif
 #undef DS41_DRAFT_ADD
     return bytes;
 }
@@ -41567,6 +41611,13 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
         return ok && (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
     }
     if (weight->type == DS4_TENSOR_F16 || weight->type == DS4_TENSOR_Q8_0) {
+        const char *fuse = round && weight->type == DS4_TENSOR_Q8_0 ?
+            getenv("DS4_ROCM_V41_Q8_SMALL_BF16_FUSION") : NULL;
+        if (round && weight->type == DS4_TENSOR_Q8_0 &&
+            ds4_gpu_dspark_gfx1151_fast_path() && (!fuse || !strcmp(fuse, "1"))) {
+            return ds4_gpu_dsv41_q8_projection_rows_bf16(out, m->map, m->size,
+                weight->abs_offset, (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], 1u, in);
+        }
         const bool ok = weight->type == DS4_TENSOR_F16 ?
             ds4_gpu_dsv41_projection_rows(out, m->map, m->size, weight->abs_offset,
                 (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], 1u, in) :
@@ -41594,6 +41645,11 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
      * requested output rounding after either projection. */
     if (!g_ds41_dspark_verify_dense &&
         (weight->type == DS4_TENSOR_F16 || weight->type == DS4_TENSOR_Q8_0)) {
+        const char *fuse = getenv("DS4_ROCM_V41_Q8_BF16_FUSION");
+        if (round && weight->type == DS4_TENSOR_Q8_0 &&
+            ds4_gpu_dspark_gfx1151_fast_path() && (!fuse || strcmp(fuse, "1") == 0))
+            return ds4_gpu_dsv41_q8_projection_rows_bf16(out, m->map, m->size,
+                weight->abs_offset, width, outputs, count, in);
         ok = weight->type == DS4_TENSOR_F16 ?
             ds4_gpu_dsv41_projection_rows(out, m->map, m->size,
                 weight->abs_offset, width, outputs, count, in) :
@@ -41723,6 +41779,13 @@ static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
 
 static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                       const ds4_model *m, const ds4_tensor *weight) {
+#ifdef DS4_ROCM_BUILD
+    const char *fuse = getenv("DS4_ROCM_V41_NORM_BF16_FUSION");
+    if (ds4_gpu_dspark_gfx1151_fast_path() && (!fuse || !strcmp(fuse,"1")))
+        return ds4_gpu_dsv41_norm(out,in,m->map,m->size,weight->abs_offset,
+            (uint32_t)weight->dim[0],1,DS4_RMS_EPS);
+#endif
+
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
         return ds4_gpu_dsv41_norm(out, in, m->map, m->size, weight->abs_offset,
@@ -41733,15 +41796,36 @@ static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
         ds41_bf16(out, (uint32_t)weight->dim[0]);
 }
 
+static bool ds41_hc_sum_bf16_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
+        const ds4_gpu_tensor *weights, bool split, uint32_t rows) {
+#ifdef DS4_ROCM_BUILD
+    const char *fuse = getenv("DS4_ROCM_V41_HC_BF16_FUSION");
+    if (ds4_gpu_dspark_gfx1151_fast_path() && (!fuse || strcmp(fuse, "1") == 0))
+        return ds4_gpu_dsv41_hc_sum(out, in, weights, DS4_N_EMBD, rows, split ? 24u : 4u);
+#endif
+    return (split ? ds4_gpu_hc_weighted_sum_split_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC) :
+        ds4_gpu_hc_weighted_sum_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC)) &&
+        ds4_gpu_dsv41_quantize(out, DS4_N_EMBD, rows, DS4_V41_BF16);
+}
+
+static bool ds41_hc_expand_bf16_rows(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split, uint32_t rows) {
+#ifdef DS4_ROCM_BUILD
+    const char *fuse = getenv("DS4_ROCM_V41_HC_BF16_FUSION");
+    if (ds4_gpu_dspark_gfx1151_fast_path() && (!fuse || strcmp(fuse, "1") == 0))
+        return ds4_gpu_dsv41_hc_expand(out, block, residual, split, DS4_N_EMBD, rows);
+#endif
+    return ds4_gpu_hc_expand_split_tensor(out, block, residual, split, DS4_N_EMBD, DS4_N_HC) &&
+        ds4_gpu_dsv41_quantize(out, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
+}
+
 static bool ds41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                         const ds4_gpu_tensor *weights, bool split) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
         return ds4_gpu_dsv41_hc_sum(out, in, weights, DS4_N_EMBD, 1, split ? 24u : 4u);
 #endif
-    return (split ? ds4_gpu_hc_weighted_sum_split_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC) :
-        ds4_gpu_hc_weighted_sum_tensor(out, in, weights, DS4_N_EMBD, DS4_N_HC)) &&
-        ds41_bf16(out, DS4_N_EMBD);
+    return ds41_hc_sum_bf16_rows(out, in, weights, split, 1);
 }
 
 static bool ds41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
@@ -41750,8 +41834,7 @@ static bool ds41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
         return ds4_gpu_dsv41_hc_expand(out, block, residual, split, DS4_N_EMBD, 1);
 #endif
-    return ds4_gpu_hc_expand_split_tensor(out, block, residual, split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(out, DS4_N_EMBD * DS4_N_HC);
+    return ds41_hc_expand_bf16_rows(out, block, residual, split, 1);
 }
 
 static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
@@ -41947,9 +42030,30 @@ static bool ds41_attention_select(ds41_gpu_graph *g, const ds4_model *m,
         ds41_attention_select_published(g, m, l, il);
 }
 
+#ifdef DS4_ROCM_BUILD
+static bool ds41_attention_pair_enabled(const ds4_layer_weights *l, uint32_t rows) {
+    const char *flag = getenv("DS4_ROCM_V41_Q8_ATTENTION_PAIR");
+    return ds4_gpu_dspark_gfx1151_fast_path() && (!flag || !strcmp(flag, "1")) &&
+        rows >= 1u && rows <= 6u &&
+        !g_ds41_dspark_verify_dense &&
+        l->attn_q_a->type == DS4_TENSOR_Q8_0 && l->attn_kv->type == DS4_TENSOR_Q8_0 &&
+        l->attn_q_a->dim[0] == 5120u && l->attn_q_a->dim[1] == 1280u &&
+        l->attn_kv->dim[0] == 5120u && l->attn_kv->dim[1] == 512u;
+}
+#endif
+
 static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_layer_weights *l) {
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
+#ifdef DS4_ROCM_BUILD
+    if (ds41_attention_pair_enabled(l, 1u)) {
+        return ds4_gpu_dsv41_q8_attention_pair_bf16(g->qr, g->kv, m->map, m->size,
+                l->attn_q_a->abs_offset, l->attn_kv->abs_offset, 1u, g->norm) &&
+            ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
+            ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr, g->tp_rank * q_dim, q_dim) &&
+            ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
+    }
+#endif
     return ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) &&
         ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
         ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr,
@@ -42029,6 +42133,14 @@ static bool ds41_stream_selected_begin(ds41_gpu_graph *g, const ds4_model *m,
         ds4_gpu_stream_expert_cache_begin_selected_load(&table, selected, 6);
 }
 #endif
+#ifdef DS4_ROCM_BUILD
+static bool ds41_rocm_shared_owner_enabled(void) {
+    const char *balance = getenv("DS4_ROCM_V41_SHARED_OWNER");
+    return ds4_gpu_dspark_gfx1151_fast_path() &&
+        (!balance || !strcmp(balance, "1"));
+}
+#endif
+
 static bool ds41_shared_balance_enabled(void) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     return ds4_gpu_device_is_spark() &&
@@ -42069,6 +42181,22 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 #endif
     bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
     bool shared_queued = false;
+#ifdef DS4_ROCM_BUILD
+    /* A DSpark session keeps its draft state during scalar catch-up too. */
+    if (shared_owner && !g->draft && !g->dspark &&
+        ds41_rocm_shared_owner_enabled() &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_down_shexp->type == DS4_TENSOR_Q8_0) {
+        const int rc = ds4_gpu_dsv41_shared_owner_scalar(g->shared,
+            g->shared_gate,g->shared_up,g->shared_mid,g->norm,g->selected,
+            m->map,m->size,l->ffn_gate_shexp->abs_offset,
+            l->ffn_up_shexp->abs_offset,l->ffn_down_shexp->abs_offset,
+            g->tp_rank,il & 1u);
+        if (rc < 0) return false;
+        if (rc > 0) { shared_here = true; shared_queued = true; }
+    }
+#endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     const bool balance_shared = shared_owner && ds41_balance_shared(g, l, 1);
     if (shared_owner && (shared_here || balance_shared) &&
@@ -42101,7 +42229,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         routed_ok = ds4_gpu_dsv41_routed_moe_tp_tensor(routed, g->gate, g->up, g->mid, g->experts,
                 m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                 l->ffn_down_exps->abs_offset, g->selected, g->route_weights,
-                g->norm, 1u, g->tp_rank);
+                g->norm, 1u, g->tp_rank, !g->draft && !g->dspark);
     } else
 #elif !defined(__APPLE__)
     if (g->tp_world == 2) {
@@ -42187,6 +42315,13 @@ static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                             const ds4_model *m, const ds4_tensor *weight, uint32_t count) {
+#ifdef DS4_ROCM_BUILD
+    const char *fuse = getenv("DS4_ROCM_V41_NORM_BF16_FUSION");
+    if (ds4_gpu_dspark_gfx1151_fast_path() && (!fuse || !strcmp(fuse,"1")))
+        return ds4_gpu_dsv41_norm(out,in,m->map,m->size,weight->abs_offset,
+            (uint32_t)weight->dim[0],count,DS4_RMS_EPS);
+#endif
+
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (!getenv("DS4_CUDA_DISABLE_V41_POINTWISE_FUSION"))
         return ds4_gpu_dsv41_norm(out, in, m->map, m->size, weight->abs_offset,
@@ -42257,10 +42392,7 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
 #endif
             b, m, l, false, count)) return false;
     /* V4.1 consumes the preceding sublayer's mixer, not the newly computed one. */
-    const bool mixed = il ?
-        ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual, b->ffn_split, DS4_N_EMBD, DS4_N_HC) :
-        ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre, DS4_N_EMBD, DS4_N_HC);
-    return mixed && ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
+    return ds41_hc_sum_bf16_rows(b->x, b->residual, il ? b->ffn_split : b->pre, il != 0, count) &&
         ds41_norm_batch(b->norm, b->x, m, l->attn_norm, count);
 }
 
@@ -42270,16 +42402,13 @@ static bool ds41_after_attention_batch(
 #endif
                               ds41_prefill_row *b, const ds4_model *m,
                                         const ds4_layer_weights *l, uint32_t count) {
-    return ds4_gpu_hc_expand_split_tensor(b->after_attn, b->block, b->residual,
-        b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds4_gpu_dsv41_quantize(b->after_attn, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16) &&
+    return ds41_hc_expand_bf16_rows(b->after_attn, b->block, b->residual, b->attn_split, count) &&
         ds41_hc_mix_batch(
 #ifdef DS4_ROCM_BUILD
             g,
 #endif
             b, m, l, true, count) &&
-        ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->after_attn, b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
+        ds41_hc_sum_bf16_rows(b->x, b->after_attn, b->attn_split, true, count) &&
         ds41_norm_batch(b->norm, b->x, m, l->ffn_norm, count);
 }
 
@@ -42287,6 +42416,35 @@ static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
                                          const ds4_layer_weights *l, uint32_t count) {
     ds41_prefill_row *b = &g->batch;
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
+#ifdef DS4_ROCM_BUILD
+    if (ds41_attention_pair_enabled(l, count)) {
+        const char *batch_norm = getenv("DS4_ROCM_V41_ATTN_BATCH_NORM");
+        const char *norm_fusion = getenv("DS4_ROCM_V41_NORM_BF16_FUSION");
+        if ((!batch_norm || !strcmp(batch_norm, "1")) &&
+            (!norm_fusion || !strcmp(norm_fusion, "1"))) {
+            const char *trace = getenv("DS4_ROCM_V41_ATTN_BATCH_NORM_TRACE");
+            if (trace && !strcmp(trace, "1"))
+                fprintf(stderr, "ds4: ROCm paired attention batch norm rows=%u rank=%u\n",
+                        count, g->tp_rank);
+            return ds4_gpu_dsv41_q8_attention_pair_bf16(b->qr, b->kv, m->map, m->size,
+                    l->attn_q_a->abs_offset, l->attn_kv->abs_offset, count, b->norm) &&
+                ds41_norm_batch(b->qr, b->qr, m, l->attn_q_a_norm, count) &&
+                ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr,
+                    g->tp_rank * q_dim, q_dim, count) &&
+                ds41_norm_batch(b->kv, b->kv, m, l->attn_kv_a_norm, count);
+        }
+        return ds4_gpu_dsv41_q8_attention_pair_bf16(b->qr, b->kv, m->map, m->size,
+                l->attn_q_a->abs_offset, l->attn_kv->abs_offset, count, b->norm) &&
+            ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
+                l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&
+            ds4_gpu_dsv41_quantize(b->qr, DS4_N_LORA_Q, count, DS4_V41_BF16) &&
+            ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr,
+                g->tp_rank * q_dim, q_dim, count) &&
+            ds4_gpu_rms_norm_weight_rows_tensor(b->kv, b->kv, m->map, m->size,
+                l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, count, DS4_RMS_EPS) &&
+            ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_BF16);
+    }
+#endif
     return ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) &&
         ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
             l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&
@@ -42614,7 +42772,7 @@ static bool ds41_moe_batch_overlap(ds41_gpu_graph *g, const ds4_model *m,
         !ds4_gpu_dsv41_routed_moe_tp_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, b->selected, b->route_weights,
-            b->norm, count, g->tp_rank)) return false;
+            b->norm, count, g->tp_rank, !g->draft && !g->dspark)) return false;
     if (!ds4_gpu_tp_big_gate_begin(il, count, b->routed, peer, bytes)) {
         ds4_gpu_tp_big_gate_abort();
         return false;
@@ -42663,7 +42821,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         ds4_gpu_dsv41_routed_moe_tp_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, b->selected, b->route_weights,
-            b->norm, count, g->tp_rank) :
+            b->norm, count, g->tp_rank, !g->draft && !g->dspark) :
 #elif !defined(__APPLE__)
         g->tp_world == 2 ?
         ds4_gpu_routed_moe_batch_owned_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
@@ -42915,11 +43073,8 @@ static bool ds41_draft_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         b->block, b->routed, b->shared, count * DS4_N_EMBD));
     DS41_DRAFT_MOE_STEP("block BF16 QDQ", ds4_gpu_dsv41_quantize(
         b->block, DS4_N_EMBD, count, DS4_V41_BF16));
-    DS41_DRAFT_MOE_STEP("HC expand", ds4_gpu_hc_expand_split_tensor(
-        b->residual, b->block, b->after_attn, b->ffn_split,
-        DS4_N_EMBD, DS4_N_HC));
-    DS41_DRAFT_MOE_STEP("residual BF16 QDQ", ds4_gpu_dsv41_quantize(
-        b->residual, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16));
+    DS41_DRAFT_MOE_STEP("HC expand/BF16", ds41_hc_expand_bf16_rows(
+        b->residual, b->block, b->after_attn, b->ffn_split, count));
 #undef DS41_DRAFT_MOE_STEP
     return true;
 }
@@ -42942,14 +43097,8 @@ static bool ds41_draft_stage(ds41_gpu_graph *g, uint32_t stage,
     } \
 } while (0)
     DS41_DRAFT_STAGE_STEP("HC mix", ok);
-    ok = stage ?
-        ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual,
-            b->ffn_split, DS4_N_EMBD, DS4_N_HC) :
-        ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual,
-            b->pre, DS4_N_EMBD, DS4_N_HC);
-    DS41_DRAFT_STAGE_STEP("HC weighted sum", ok);
-    DS41_DRAFT_STAGE_STEP("input BF16 QDQ", ds4_gpu_dsv41_quantize(
-        b->x, DS4_N_EMBD, count, DS4_V41_BF16));
+    DS41_DRAFT_STAGE_STEP("HC weighted sum/BF16", ds41_hc_sum_bf16_rows(
+        b->x, b->residual, stage ? b->ffn_split : b->pre, stage != 0, count));
     DS41_DRAFT_STAGE_STEP("attention norm", ds41_norm_batch(
         b->norm, b->x, m, l->attn_norm, count));
     DS41_DRAFT_STAGE_STEP("attention projections", ds41_attention_project_batch(
@@ -43165,12 +43314,16 @@ static bool ds41_draft_init(ds41_gpu_graph *g,
             DS4_N_VOCAB * sizeof(float))) ||
         !(d->rows_x = ds4_gpu_tensor_alloc(win * dim * sizeof(float))) ||
         !(d->rows_tmp = ds4_gpu_tensor_alloc(win * dim * sizeof(float))) ||
+#ifdef DS4_ROCM_BUILD
+        !ds41_draft_prepare_markov_head(d, dm, markov_head) ||
+#else
         (markov_head->type == DS4_TENSOR_F16 &&
             (!(d->markov_head_t = ds4_gpu_tensor_alloc(
                 (uint64_t)DS4_N_VOCAB * d->rank * sizeof(uint16_t))) ||
              !ds4_gpu_dsv41_markov_prepare_head(d->markov_head_t,
                 dm->map, dm->size, markov_head->abs_offset,
                 DS4_N_VOCAB, d->rank))) ||
+#endif
         !ds4_gpu_tensor_write(d->conf_proj, 0,
             (const char *)dm->map + proj->abs_offset, proj_bytes)) {
         ds41_draft_free(d);
@@ -43217,6 +43370,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
 #endif
         (g->tp_world == 2 && !g->imatrix &&
          !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"));
+    /* Resident target logits already finish the same ordered stream after
+     * the output head. Keep every other completion boundary unchanged. */
+    bool defer_trunk_drain = false;
+#ifdef DS4_ROCM_BUILD
+    const char *defer = getenv("DS4_ROCM_V41_DEFER_TRUNK_DRAIN");
+    defer_trunk_drain = ds4_gpu_dspark_gfx1151_fast_path() &&
+        (!defer || !strcmp(defer, "1")) && queue_layers &&
+        g->tp_world == 1u && !g->draft && !g->dspark && logits;
+#endif
     if (g->draft) {
         /* A scalar speculative verifier reserves the whole proposed interval
          * up front so each ordinary decode row lands in its own feature slot. */
@@ -43246,7 +43408,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         /* TP gates already submit ordered, bounded command buffers. Drain
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
-        const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
+        const bool drain = !queue_layers || il == 13 ||
+            (il + 1u == DS4_N_LAYER && !defer_trunk_drain);
+#ifdef DS4_ROCM_BUILD
+        if (ok && defer_trunk_drain && il + 1u == DS4_N_LAYER) {
+            const char *trace = getenv("DS4_ROCM_V41_DEFER_TRUNK_TRACE");
+            if (trace && !strcmp(trace, "1"))
+                fprintf(stderr, "ds4: ROCm deferred trunk drain pos=%u target-only\n", g->pos);
+        }
+#endif
         if (drain && !ds4_gpu_end_commands()) ok = false;
 #ifdef DS4_ROCM_BUILD
         if (ds41_tp_failed(g)) ok = false;
@@ -43536,11 +43706,9 @@ static bool ds41_decoder_prepare(ds41_gpu_graph *g, const ds4_model *m,
 #undef DS41_DECODER_VIEW
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         if (ok) ok = ds41_carry_copy(g, off, count, false);
-        if (ok && batch_attention) ok = split_pre ?
-            ds4_gpu_hc_weighted_sum_split_tensor(active.x, active.residual, active.ffn_split,
-                                                DS4_N_EMBD, DS4_N_HC) :
-            ds4_gpu_hc_weighted_sum_tensor(active.x, active.residual, active.pre, DS4_N_EMBD, DS4_N_HC);
-        if (ok && batch_attention) ok = ds4_gpu_dsv41_quantize(active.x, DS4_N_EMBD, count, DS4_V41_BF16) &&
+        if (ok && batch_attention) ok = ds41_hc_sum_bf16_rows(active.x, active.residual,
+            split_pre ? active.ffn_split : active.pre, split_pre, count);
+        if (ok && batch_attention) ok =
             ds41_norm_batch(active.norm, active.x, m, l->attn_norm, count);
         if (ok && batch_publish)
             ok = ds41_attention_publish_batch(g, &active, m, l, il, initial_start + off, count);
@@ -43954,8 +44122,20 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             if (ok) ok = ds4_gpu_begin_commands() != 0;
             if (!il) {
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-                if (ok && !g->image_count) {
+#if !defined(__APPLE__)
+                bool batch_text_embed = true;
+#ifdef DS4_ROCM_BUILD
+                const char *batch_text_env = getenv("DS4_ROCM_V41_BATCH_TEXT_EMBED");
+                batch_text_embed = ds4_gpu_dspark_gfx1151_fast_path() && count >= 256u &&
+                    (!batch_text_env || atoi(batch_text_env) != 0);
+#endif
+                if (ok && !g->image_count && batch_text_embed) {
+#ifdef DS4_ROCM_BUILD
+                    const char *trace = getenv("DS4_ROCM_V41_BATCH_TEXT_EMBED_TRACE");
+                    if (trace && atoi(trace) != 0)
+                        fprintf(stderr, "ds4: ROCm batch text embedding rows=%u start=%u rank=%u\n",
+                            count, start, g->tp_rank);
+#endif
                     float *pre = calloc((size_t)count * DS4_N_HC, sizeof(float));
                     if (!pre) ok = false;
                     else {
@@ -44114,9 +44294,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 if (ok && batch_hc) {
                     ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
                         ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, count, DS4_V41_BF16) &&
-                        ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
-                            active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-                        ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
+                        ds41_hc_expand_bf16_rows(active.residual, active.block, active.after_attn, active.ffn_split, count);
                 }
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
 #define DS41_USE_MOE_ROW(name, width) row.name = g->rows_view[t].name;
@@ -44304,17 +44482,45 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #ifdef DS4_ROCM_BUILD
     const double engram_t0 = dspark_profile ? now_sec() : 0.0;
 #endif
+    bool engram_async = false;
+#ifdef DS4_ROCM_BUILD
+    const char *engram_batch_env = getenv("DS4_ROCM_V41_ENGRAM_BATCH_PREFETCH");
+    bool engram_batch_admitted = ds4_gpu_dspark_gfx1151_fast_path() &&
+        (!engram_batch_env || atoi(engram_batch_env) != 0) &&
+        g->draft && g->engram_reader && engram && prefill_rows == rows &&
+        rows <= DS4_ENGRAM_READER_MAX_TOKENS;
+    for (int i = 0; engram_batch_admitted && i < count; i++)
+        engram_batch_admitted = graphs[i] == g && !ds41_image_at(g, g->pos + (uint32_t)i);
+    if (ok && engram_batch_admitted) {
+        uint32_t batch_ids[DS4_ENGRAM_READER_MAX_TOKENS][2][DS4_ENGRAM_COLS];
+        for (int i = 0; ok && i < count; i++) {
+            positions[i] = g->pos + (uint32_t)i;
+            history[i] = i ? history[i - 1] : g->history;
+            ok = ds4_engram_hash(&g->engram, &history[i], &tokens[i], NULL, 1, &batch_ids[i][0][0]);
+        }
+        if (ok) {
+            ok = ds4_engram_reader_start_batch(g->engram_reader, g->table,
+                &batch_ids[0][0][0], rows, (float *)engram);
+            engram_async = ok;
+            const char *trace = getenv("DS4_ROCM_V41_ENGRAM_BATCH_TRACE");
+            if (ok && trace && atoi(trace) != 0)
+                fprintf(stderr, "ds4: ROCm Engram batch prefetch rows=%u rank=%u\n", rows, g->tp_rank);
+        }
+    }
+#endif
     for (int i = 0; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
         uint32_t ids[2][DS4_ENGRAM_COLS];
-        const bool continued = i > 0 && (uint32_t)i < prefill_rows;
-        positions[i] = s->pos + (continued ? (uint32_t)i : 0u);
-        history[i] = continued ? history[i - 1] : s->history;
-        ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[0][0]);
-        float (*disk_rows)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] =
-            engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
-        for (unsigned table = 0; ok && table < 2; table++)
-            ok = ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
+        if (!engram_async) {
+            const bool continued = i > 0 && (uint32_t)i < prefill_rows;
+            positions[i] = s->pos + (continued ? (uint32_t)i : 0u);
+            history[i] = continued ? history[i - 1] : s->history;
+            ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[0][0]);
+            float (*disk_rows)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] =
+                engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
+            for (unsigned table = 0; ok && table < 2; table++)
+                ok = ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
+        }
         if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].pre, 0, initial_pre, sizeof(initial_pre)) &&
             ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
@@ -44337,9 +44543,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
 #endif
         if (ds41_engram_layer(il)) {
             const unsigned table = il == 1 ? 0 : 1;
+            if (engram_async) ok = ds4_engram_reader_wait(g->engram_reader, table);
             for (int i = 0; ok && i < count; i++) {
                 ds41_gpu_graph *s = graphs[i];
                 ok = ds4_gpu_tensor_write(g->rows_view[i].engram_rows, 0,
+                    engram_async ? (float *)engram + ((size_t)table * rows + (uint32_t)i) * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM :
                     engram && (uint32_t)i < prefill_rows ? engram[i][table] : s->rows[table],
                     sizeof(s->rows[table]));
             }
@@ -44433,9 +44641,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
                 ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
             ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
-                active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-            ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
+            ds41_hc_expand_bf16_rows(active.residual, active.block, active.after_attn, active.ffn_split, rows);
 #ifdef DS4_ROCM_BUILD
         if (dspark_profile && ok) {
             ok = ds4_gpu_synchronize();
@@ -44466,8 +44672,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                                  (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) &&
             ds4_gpu_tensor_copy(s->pre, 0, g->rows_view[i].ffn_split, 0, DS4_N_HC * sizeof(float));
         if (!ok || prefill_only) continue;
-        ok = ds4_gpu_hc_weighted_sum_tensor(s->x, s->residual, s->pre, DS4_N_EMBD, DS4_N_HC) &&
-            ds41_bf16(s->x, DS4_N_EMBD) && ds41_norm(s->norm, s->x, model, weights->output_norm);
+        ok = ds41_hc_sum_bf16_rows(s->x, s->residual, s->pre, false, 1) && ds41_norm(s->norm, s->x, model, weights->output_norm);
         if (ok) ok = batch_logits ?
             ds4_gpu_tensor_copy(g->rows_view[i].norm, 0, s->norm, 0, DS4_N_EMBD * sizeof(float)) :
             ds41_output_projection(s, s->tp_logits_half ? s->tp_logits_half : s->logits,
@@ -44520,6 +44725,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ds4_gpu_tensor_free(queries[i]);
         ds4_gpu_tensor_free(heads[i]);
     }
+    /* All reader borrowers must finish before releasing scratch, including errors. */
+    if (engram_async && !ds4_engram_reader_wait(g->engram_reader, 1)) ok = false;
     free(engram);
     return ok;
 }
@@ -44593,9 +44800,7 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m,
         ds4_gpu_tensor *xn = ds4_gpu_tensor_view(d->xn, 0,
             (uint64_t)n * DS4_N_EMBD * sizeof(float));
         ok = res && split && x && xn &&
-            ds4_gpu_hc_weighted_sum_split_tensor(x, res, split,
-                DS4_N_EMBD, DS4_N_HC) &&
-            ds4_gpu_dsv41_quantize(x, DS4_N_EMBD, n, DS4_V41_BF16) &&
+            ds41_hc_sum_bf16_rows(x, res, split, true, n) &&
             ds41_norm_batch(xn, x, m, w->output_norm, n) &&
             ds41_output_projection(g, d->rows_logits, m, w, xn, n) &&
             ds41_draft_pending(g);
@@ -75945,6 +76150,10 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER")) {
         execution_mode |= DS4_TP_MODE_V41_SHARED_OWNER;
         if (ds41_shared_balance_enabled()) execution_mode |= DS4_TP_MODE_V41_SHARED_BALANCE;
+#ifdef DS4_ROCM_BUILD
+        if (!e->dspark && ds41_rocm_shared_owner_enabled())
+            execution_mode |= DS4_TP_MODE_V41_ROCM_SHARED_OWNER;
+#endif
     }
     if (!ds4_tp_agree_execution_mode(tp, execution_mode, err, errlen)) return 0;
     const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
@@ -88486,6 +88695,43 @@ static bool ds41_draft_should_propose(bool draftable, bool cost_scheduled,
     return !skip_left || adaptive_off;
 }
 
+/* Opt-in attribution only. Emit after completion; hexadecimal confidence
+ * values preserve every binary32 bit. No draft or sampling decision reads it. */
+static void ds41_draft_trace_cycle(const ds4_session *s,
+        uint32_t pos, uint32_t remaining_ctx, bool tp, bool sampled,
+        bool draftable, bool proposed, bool scheduled, bool seed_stop,
+        uint32_t block, const uint32_t caps[5], uint32_t width,
+        uint32_t matched, uint32_t kept, bool replacement,
+        bool valid_acceptance, int max_tokens, int accepted_cap,
+        const float *confidence, double proposal_ms, double verify_ms,
+        double commit_ms, double target_ms, double total_ms) {
+    /* caps: scheduled, fixed-width, request budget, output capacity, context. */
+    const bool tail = caps[1] != caps[4] || max_tokens <= 1 ||
+        accepted_cap <= 1 || remaining_ctx <= block;
+    flockfile(stderr);
+    fprintf(stderr, "DS41_PHASE_COST v=1 session=%p pos=%u tp=%d sampled=%d "
+        "draftable=%d proposed=%d scheduled=%d seed_stop=%d block=%u "
+        "caps=%u,%u,%u,%u,%u width=%u accepted=%u kept=%u replacement=%d "
+        "valid_acceptance=%d tail=%d candidate_truncated=%d max_tokens=%d "
+        "accepted_cap=%d remaining_ctx=%u proposal_ms=%.9f verify_ms=%.9f "
+        "commit_ms=%.9f target_ms=%.9f total_ms=%.9f confidence_count=%u confidence=",
+        (const void *)s, pos, (int)tp, (int)sampled, (int)draftable,
+        (int)proposed, (int)scheduled, (int)seed_stop, block,
+        caps[0], caps[1], caps[2], caps[3], caps[4], width, matched, kept,
+        (int)replacement, (int)valid_acceptance, (int)tail,
+        (int)(caps[4] != width), max_tokens, accepted_cap, remaining_ctx,
+        proposal_ms, verify_ms, commit_ms, target_ms, total_ms,
+        proposed ? block : 0u);
+    if (proposed) {
+        for (uint32_t i = 0; i < block; ++i)
+            fprintf(stderr, "%s%a", i ? "," : "", (double)confidence[i]);
+    } else {
+        fputc('-', stderr);
+    }
+    fputc('\n', stderr);
+    funlockfile(stderr);
+}
+
 /* Draft from the last committed target features, verify the seed and draft
  * suffix together, then retain only the target-accepted prefix. */
 static int ds41_session_spec(ds4_session *s, int first_token,
@@ -88502,6 +88748,12 @@ static int ds41_session_spec(ds4_session *s, int first_token,
     const bool exact = rng && temperature > 0.0f;
     const bool stats = ds4_dspark_stats_enabled();
     const bool tp_verify = ds4_session_tp_leader(s);
+    bool cost_trace = false;
+#ifdef DS4_ROCM_BUILD
+    const char *cost_env = getenv("DS4_ROCM_DSPARK_PHASE_TRACE");
+    cost_trace = cost_env && strcmp(cost_env, "1") == 0;
+#endif
+    uint32_t trace_caps[5] = {0};
     const double t0 = now_sec();
     int drafts[DS4_DSPARK_MAX_BLOCK_SIZE];
     float confidence[DS4_DSPARK_MAX_BLOCK_SIZE];
@@ -88539,11 +88791,16 @@ static int ds41_session_spec(ds4_session *s, int first_token,
             ds41_draft_scheduled_prefix_len(confidence, B, tp_verify) :
             dspark_confident_prefix_len(confidence, B,
                                         e->dspark_confidence_threshold);
+        if (cost_trace) trace_caps[0] = k;
         const uint32_t width_limit = ds41_draft_width_limit(B);
         if (k > width_limit) k = width_limit;
+        if (cost_trace) trace_caps[1] = k;
         if (k > (uint32_t)max_tokens - 1u) k = (uint32_t)max_tokens - 1u;
+        if (cost_trace) trace_caps[2] = k;
         if (k > (uint32_t)accepted_cap - 1u) k = (uint32_t)accepted_cap - 1u;
+        if (cost_trace) trace_caps[3] = k;
         if (k > g->ctx - pos - 1u - exact) k = g->ctx - pos - 1u - exact;
+        if (cost_trace) trace_caps[4] = k;
         for (uint32_t i = 0; i < k; i++) {
             if (drafts[i] < 0 || drafts[i] >= (int)vocab) { k = i; break; }
             if (!ignore_eos && drafts[i] == eos_token) { k = i; break; }
@@ -88568,12 +88825,21 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         fprintf(stderr, "\n");
     }
     if (k == 0) {
+        const double target_started = cost_trace ? now_sec() : 0.0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         ds41_draft_adapt(d, proposed, 0, 0, tp_verify);
         if (stats) {
             ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
             s->dspark_stats.total_ms += (now_sec() - t0) * 1000.0;
+        }
+        if (cost_trace) {
+            const double done = now_sec();
+            ds41_draft_trace_cycle(s, pos, g->ctx - pos, tp_verify, exact,
+                draftable, proposed, cost_scheduled, first_token == eos_token,
+                B, trace_caps, 0, 0, 1, false, true, max_tokens, accepted_cap,
+                confidence, propose_seconds * 1000.0, 0.0, 0.0,
+                (done - target_started) * 1000.0, (done - t0) * 1000.0);
         }
         return 1;
     }
@@ -88591,7 +88857,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         payload_set_err(err, errlen, "tp: V4.1 verify send failed");
         return -1;
     }
-    const double tv = stats ? now_sec() : 0.0;
+    const double tv = (stats || cost_trace) ? now_sec() : 0.0;
     bool ok = ds41_draft_verify(g, &e->model, &e->weights,
                                 tokens, n, rows);
     if (tp_verify && e->tp.vocab_split) {
@@ -88608,7 +88874,9 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         }
         free(peer);
     }
-    if (stats) s->dspark_stats.verify_ms += (now_sec() - tv) * 1000.0;
+    const double verified_at = cost_trace ? now_sec() : 0.0;
+    if (stats) s->dspark_stats.verify_ms +=
+        ((cost_trace ? verified_at : now_sec()) - tv) * 1000.0;
     if (!ok) {
         if (tp_verify)
             (void)ds4_tp_send_verify_commit(e->tp.ctx,
@@ -88662,6 +88930,7 @@ static int ds41_session_spec(ds4_session *s, int first_token,
         payload_set_err(err, errlen, "DeepSeek V4.1 draft rollback failed");
         return -1;
     }
+    const double committed_at = cost_trace ? now_sec() : 0.0;
     if (replacement >= 0) {
         if (ds4_session_eval(s, replacement, err, errlen) != 0) return -1;
         accepted[matched + 1u] = replacement;
@@ -88679,6 +88948,16 @@ static int ds41_session_spec(ds4_session *s, int first_token,
                 pos, k, matched, replacement);
     const uint32_t kept = 1u + matched + (replacement >= 0);
     ds41_draft_adapt(d, true, k, matched, tp_verify);
+    if (cost_trace) {
+        const double done = now_sec();
+        ds41_draft_trace_cycle(s, pos, g->ctx - pos, tp_verify, exact,
+            draftable, proposed, cost_scheduled, first_token == eos_token,
+            B, trace_caps, k, matched, kept, replacement >= 0,
+            !(exact && matched < k && replacement < 0), max_tokens, accepted_cap,
+            confidence, propose_seconds * 1000.0, (verified_at - tv) * 1000.0,
+            (committed_at - verified_at) * 1000.0,
+            (done - committed_at) * 1000.0, (done - t0) * 1000.0);
+    }
     return (int)kept;
 }
 

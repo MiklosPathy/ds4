@@ -685,6 +685,7 @@ static int check_dspark_markov(void) {
         {3, 257, 32, 64, 1, 0},
         {5, 521, 64, 127, 7, 1},
         {5, 4099, 256, 5120, 64, 1},
+        {5, 129280, 256, 5120, 1024, 1},
     };
     const uint32_t block = shapes[requested_shape].block;
     const uint32_t vocab = shapes[requested_shape].vocab;
@@ -868,13 +869,16 @@ static int check_f32_projection(void) {
     float *weights = model;
     float *input = malloc(nx * 4), *actual = malloc(ny * 4), *scalar = malloc(ny * 4);
     CHECK(input && actual && scalar);
-    for (size_t i = 0; i < weight_bytes / 4; i++) weights[i] = random_value();
+    for (size_t i = 0; i < weight_bytes / 4; i++) weights[i] = getenv("DS4_TEST_ROUTER_BF16") ? bf16(random_value()) : random_value();
     for (size_t i = 0; i < nx; i++) input[i] = i % 511 ? bf16(random_value()) : 1.0001f;
     CHECK(ds4_gpu_set_model_map(model, weight_bytes));
     ds4_gpu_tensor *xt = upload(input, nx * 4), *out = upload(NULL, ny * 4), *ref = upload(NULL, ny * 4);
     CHECK(xt && out && ref);
     RUN(ds4_gpu_dsv41_f32_projection_rows(out, model, weight_bytes, 0, width, output, rows, xt));
     CHECK(ds4_gpu_tensor_read(out, 0, actual, ny * 4));
+    RUN(ds4_gpu_dsv41_f32_projection_rows(ref, model, weight_bytes, 0, width, output, rows, xt));
+    CHECK(ds4_gpu_tensor_read(ref, 0, scalar, ny * 4));
+    CHECK(!memcmp(actual,scalar,ny*4));
     for (uint32_t row = 0; row < rows; row++) {
         ds4_gpu_tensor *xr = ds4_gpu_tensor_view(xt, (size_t)row * width * 4, width * 4);
         ds4_gpu_tensor *yr = ds4_gpu_tensor_view(ref, (size_t)row * output * 4, output * 4);
@@ -901,6 +905,42 @@ static int check_f32_projection(void) {
     CHECK(!ds4_gpu_dsv41_f32_projection_rows(out, model, weight_bytes, 0, width, output, rows + 1, xt));
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(ref);
     ds4_gpu_cleanup(); free(model); free(input); free(actual); free(scalar);
+    return ds4_gpu_init();
+}
+
+static int check_router_packed_cache(void) {
+    enum { WIDTH=5120, OUTPUT=128, ROWS=6, OFFSET=64 };
+    const size_t weight_bytes=(size_t)WIDTH*OUTPUT*4, bytes=OFFSET+weight_bytes;
+    void *models[2]={NULL,NULL};
+    for(unsigned m=0;m<2;m++) {
+        CHECK(!posix_memalign(&models[m],(size_t)sysconf(_SC_PAGESIZE),bytes));
+        memset(models[m],0,bytes);
+        float *w=(float *)((char *)models[m]+OFFSET);
+        for(size_t i=0;i<weight_bytes/4;i++) w[i]=bf16(random_value());
+    }
+    float *input=malloc(WIDTH*ROWS*4), *expected=malloc(OUTPUT*ROWS*4), *actual=malloc(OUTPUT*ROWS*4);
+    CHECK(input && expected && actual);
+    for(unsigned i=0;i<WIDTH*ROWS;i++) input[i]=random_value()+0.00001f;
+    CHECK(ds4_gpu_set_model_map(models[0],bytes));
+    ds4_gpu_tensor *x=upload(input,WIDTH*ROWS*4), *y=upload(NULL,OUTPUT*ROWS*4);
+    CHECK(x && y);
+    for(unsigned phase=0;phase<2;phase++) {
+        if(phase) { CHECK(ds4_gpu_set_model_map(models[1],bytes)); fprintf(stderr,"Router cache model switch\n"); }
+        for(unsigned m=0;m<2;m++) for(unsigned rows=1;rows<=6;rows+=5) {
+            CHECK(!setenv("DS4_ROCM_V41_ROUTER_PACKED","0",1));
+            RUN(ds4_gpu_dsv41_f32_projection_rows(y,models[m],bytes,OFFSET,WIDTH,OUTPUT,rows,x));
+            CHECK(ds4_gpu_tensor_read(y,0,expected,OUTPUT*rows*4));
+            CHECK(!setenv("DS4_ROCM_V41_ROUTER_PACKED","1",1));
+            for(unsigned repeat=0;repeat<2;repeat++) {
+                RUN(ds4_gpu_dsv41_f32_projection_rows(y,models[m],bytes,OFFSET,WIDTH,OUTPUT,rows,x));
+                CHECK(ds4_gpu_tensor_read(y,0,actual,OUTPUT*rows*4));
+                CHECK(!memcmp(expected,actual,OUTPUT*rows*4));
+            }
+        }
+    }
+    ds4_gpu_tensor_free(x);ds4_gpu_tensor_free(y);ds4_gpu_cleanup();
+    free(models[0]);free(models[1]);free(input);free(expected);free(actual);
+    fprintf(stderr,"Router cache two models/same offset, both layouts, reuse and map-switch cleanup: exact PASS\n");
     return ds4_gpu_init();
 }
 
@@ -1053,6 +1093,256 @@ static int check_q8_prefill_projection(void) {
     ds4_gpu_tensor_free(input_tensor);
     ds4_gpu_cleanup();
     free(model); free(input); free(actual);
+    return ds4_gpu_init();
+}
+
+static int check_q8_bf16_projection(void) {
+    static const uint32_t dimensions[][2] = {
+        {5120,512}, {5120,1280}, {5120,2304}, {2304,5120}, {1280,32768}, {1280,16384},
+    };
+    static const uint32_t counts[] = {1,6,31,32,65,128,129,1984,2048,2049};
+    static const uint32_t quality_shapes[] = {3,7,13,23,33,43,45,53};
+    const bool quality = requested_shape >= 60;
+    const unsigned index = quality ? quality_shapes[requested_shape - 60] : requested_shape;
+    const uint32_t width = dimensions[index / 10][0], output = dimensions[index / 10][1];
+    const uint32_t rows = counts[index % 10];
+    const bool wmma = !quality && rows >= 32 && rows <= 2048 && (width == 1280 || rows != 128);
+    enum { TERMS = 8 };
+    ds4_gpu_set_quality(quality);
+    const size_t blocks_per_row = width / 32u;
+    const size_t weight_bytes = (size_t)output * blocks_per_row * sizeof(fixture_q8);
+    const size_t input_values = (size_t)rows * width;
+    const size_t output_values = (size_t)rows * output;
+    void *model = NULL;
+    CHECK(!posix_memalign(&model, (size_t)sysconf(_SC_PAGESIZE), weight_bytes));
+    memset(model, 0, weight_bytes);
+    fixture_q8 *weights = model;
+    for (uint32_t out = 0; out < output; out++) for (uint32_t term = 0; term < TERMS; term++) {
+        const uint32_t column = q8_prefill_column(out, term, width);
+        fixture_q8 *block = &weights[(size_t)out * blocks_per_row + column / 32u];
+        block->scale = 0x2000u;
+        block->q[column % 32u] = (int8_t)q8_prefill_coefficient(out, term);
+    }
+    float *input = malloc(input_values * sizeof(*input));
+    float *actual = malloc(output_values * sizeof(*actual));
+    CHECK(input && actual);
+    for (size_t i = 0; i < input_values; i++)
+        input[i] = ((int)((i * 37u + 19u) % 257u) - 128) / 31.0f +
+            ((i & 1u) ? 0.00012345f : -0.00012345f);
+    CHECK(ds4_gpu_set_model_map(model, weight_bytes));
+    ds4_gpu_tensor *input_tensor = upload(input, input_values * sizeof(*input));
+    ds4_gpu_tensor *output_tensor = upload(NULL, output_values * sizeof(*actual));
+    CHECK(input_tensor && output_tensor);
+    RUN(ds4_gpu_dsv41_q8_projection_rows(output_tensor, model, weight_bytes, 0,
+        width, output, rows, input_tensor));
+    CHECK(ds4_gpu_tensor_read(output_tensor, 0, actual, output_values * sizeof(*actual)));
+    double worst_fraction = 0.0;
+    for (uint32_t row = 0; row < rows; row++) for (uint32_t out = 0; out < output; out++) {
+        double sum = 0.0, magnitude = 0.0;
+        for (uint32_t term = 0; term < TERMS; term++) {
+            const uint32_t column = q8_prefill_column(out, term, width);
+            const float activation = !wmma ? input[(size_t)row * width + column]
+                                                   : reference_f16(input[(size_t)row * width + column]);
+            const double product = (double)activation *
+                q8_prefill_coefficient(out, term) / 128.0;
+            sum += product;
+            magnitude += fabs(product);
+        }
+        const float got = actual[(size_t)row * output + out];
+        const double tolerance = projection_roundoff_bound(magnitude, width) + 0x1p-22;
+        const double error = fabs((double)got - sum);
+        CHECK(isfinite(got) && error <= tolerance);
+        worst_fraction = fmax(worst_fraction, error / tolerance);
+    }
+    fprintf(stderr, "Q8 prefill projection width=%u output=%u rows=%u full %s/F32 oracle worst_fraction=%.9g\n",
+            width, output, rows, !wmma ? "F32" : "F16", worst_fraction);
+    ds4_gpu_tensor *fused = upload(NULL, output_values * sizeof(float));
+    float *rounded = malloc(output_values * sizeof(float));
+    float *got = malloc(output_values * sizeof(float));
+    CHECK(fused && rounded && got);
+    RUN(ds4_gpu_dsv41_quantize(output_tensor, output, rows, DS4_V41_BF16));
+    RUN(ds4_gpu_dsv41_q8_projection_rows_bf16(fused, model, weight_bytes, 0,
+        width, output, rows, input_tensor));
+    CHECK(ds4_gpu_tensor_read(output_tensor, 0, rounded, output_values * sizeof(float)));
+    CHECK(ds4_gpu_tensor_read(fused, 0, got, output_values * sizeof(float)));
+    CHECK(!memcmp(got, rounded, output_values * sizeof(float)));
+    for (size_t i = 0; i < output_values; i++) {
+        const float expected = bf16(actual[i]);
+        CHECK(!memcmp(got + i, &expected, sizeof(float)));
+    }
+    CHECK(!ds4_gpu_dsv41_q8_projection_rows_bf16(fused, model, weight_bytes - 1u, 0,
+        width, output, rows, input_tensor));
+    CHECK(!ds4_gpu_dsv41_q8_projection_rows_bf16(fused, model, weight_bytes, 0,
+        width, output, rows + 1u, input_tensor));
+    CHECK(!ds4_gpu_dsv41_q8_projection_rows_bf16(fused, model, weight_bytes, 0,
+        width - 1u, output, rows, input_tensor));
+    for (size_t offset = 0; offset < input_values; offset += output_values) {
+        const size_t remaining = input_values - offset;
+        const size_t count = remaining < output_values ? remaining : output_values;
+        CHECK(ds4_gpu_tensor_read(input_tensor, offset * sizeof(float), got, count * sizeof(float)));
+        CHECK(!memcmp(got, input + offset, count * sizeof(float)));
+    }
+    fprintf(stderr, "Q8 BF16 API exact %zu outputs; quality=%u wmma=%u\n", output_values, quality, wmma);
+    free(rounded); free(got); ds4_gpu_tensor_free(fused);
+    CHECK(!ds4_gpu_dsv41_q8_projection_rows(output_tensor, model, weight_bytes - 1u, 0,
+        width, output, rows, input_tensor));
+    CHECK(!ds4_gpu_dsv41_q8_projection_rows(output_tensor, model, weight_bytes, 0,
+        width, output, rows + 1u, input_tensor));
+    ds4_gpu_tensor_free(output_tensor);
+    ds4_gpu_tensor_free(input_tensor);
+    ds4_gpu_cleanup();
+    free(model); free(input); free(actual);
+    return ds4_gpu_init();
+}
+
+static int check_q8_small_bf16_projection(void) {
+    static const uint32_t dimensions[][2] = {
+        {5120,512}, {5120,1280}, {5120,2304}, {2304,5120}, {1280,32768}, {1280,16384},
+    };
+    static const uint32_t counts[] = {1,2,3,4,5,6};
+    CHECK(!setenv("DS4_ROCM_V41_Q8_SMALL_BF16_FUSION", "1", 1));
+    CHECK(!setenv("DS4_ROCM_V41_Q8_SMALL_BF16_TRACE", "1", 1));
+    const bool quality = requested_shape >= 36;
+    const unsigned index = requested_shape % 36;
+    const uint32_t width = dimensions[index / 6][0], output = dimensions[index / 6][1];
+    const uint32_t rows = counts[index % 6];
+    const bool wmma = !quality && rows >= 32 && rows <= 2048 && (width == 1280 || rows != 128);
+    enum { TERMS = 8 };
+    ds4_gpu_set_quality(quality);
+    const size_t blocks_per_row = width / 32u;
+    const size_t weight_bytes = (size_t)output * blocks_per_row * sizeof(fixture_q8);
+    const size_t input_values = (size_t)rows * width;
+    const size_t output_values = (size_t)rows * output;
+    void *model = NULL;
+    CHECK(!posix_memalign(&model, (size_t)sysconf(_SC_PAGESIZE), weight_bytes));
+    memset(model, 0, weight_bytes);
+    fixture_q8 *weights = model;
+    for (uint32_t out = 0; out < output; out++) for (uint32_t term = 0; term < TERMS; term++) {
+        const uint32_t column = q8_prefill_column(out, term, width);
+        fixture_q8 *block = &weights[(size_t)out * blocks_per_row + column / 32u];
+        block->scale = 0x2000u;
+        block->q[column % 32u] = (int8_t)q8_prefill_coefficient(out, term);
+    }
+    float *input = malloc(input_values * sizeof(*input));
+    float *actual = malloc(output_values * sizeof(*actual));
+    CHECK(input && actual);
+    for (size_t i = 0; i < input_values; i++)
+        input[i] = ((int)((i * 37u + 19u) % 257u) - 128) / 31.0f +
+            ((i & 1u) ? 0.00012345f : -0.00012345f);
+    CHECK(ds4_gpu_set_model_map(model, weight_bytes));
+    ds4_gpu_tensor *input_tensor = upload(input, input_values * sizeof(*input));
+    ds4_gpu_tensor *output_tensor = upload(NULL, output_values * sizeof(*actual));
+    CHECK(input_tensor && output_tensor);
+    RUN(ds4_gpu_dsv41_q8_projection_rows(output_tensor, model, weight_bytes, 0,
+        width, output, rows, input_tensor));
+    CHECK(ds4_gpu_tensor_read(output_tensor, 0, actual, output_values * sizeof(*actual)));
+    double worst_fraction = 0.0;
+    for (uint32_t row = 0; row < rows; row++) for (uint32_t out = 0; out < output; out++) {
+        double sum = 0.0, magnitude = 0.0;
+        for (uint32_t term = 0; term < TERMS; term++) {
+            const uint32_t column = q8_prefill_column(out, term, width);
+            const float activation = !wmma ? input[(size_t)row * width + column]
+                                                   : reference_f16(input[(size_t)row * width + column]);
+            const double product = (double)activation *
+                q8_prefill_coefficient(out, term) / 128.0;
+            sum += product;
+            magnitude += fabs(product);
+        }
+        const float got = actual[(size_t)row * output + out];
+        const double tolerance = projection_roundoff_bound(magnitude, width) + 0x1p-22;
+        const double error = fabs((double)got - sum);
+        CHECK(isfinite(got) && error <= tolerance);
+        worst_fraction = fmax(worst_fraction, error / tolerance);
+    }
+    fprintf(stderr, "Q8 prefill projection width=%u output=%u rows=%u full %s/F32 oracle worst_fraction=%.9g\n",
+            width, output, rows, !wmma ? "F32" : "F16", worst_fraction);
+    ds4_gpu_tensor *fused = upload(NULL, output_values * sizeof(float));
+    float *rounded = malloc(output_values * sizeof(float));
+    float *got = malloc(output_values * sizeof(float));
+    CHECK(fused && rounded && got);
+    RUN(ds4_gpu_dsv41_quantize(output_tensor, output, rows, DS4_V41_BF16));
+    RUN(ds4_gpu_dsv41_q8_projection_rows_bf16(fused, model, weight_bytes, 0,
+        width, output, rows, input_tensor));
+    CHECK(ds4_gpu_tensor_read(output_tensor, 0, rounded, output_values * sizeof(float)));
+    CHECK(ds4_gpu_tensor_read(fused, 0, got, output_values * sizeof(float)));
+    CHECK(!memcmp(got, rounded, output_values * sizeof(float)));
+    for (size_t i = 0; i < output_values; i++) {
+        const float expected = bf16(actual[i]);
+        CHECK(!memcmp(got + i, &expected, sizeof(float)));
+    }
+    CHECK(!ds4_gpu_dsv41_q8_projection_rows_bf16(fused, model, weight_bytes - 1u, 0,
+        width, output, rows, input_tensor));
+    CHECK(!ds4_gpu_dsv41_q8_projection_rows_bf16(fused, model, weight_bytes, 0,
+        width, output, rows + 1u, input_tensor));
+    CHECK(!ds4_gpu_dsv41_q8_projection_rows_bf16(fused, model, weight_bytes, 0,
+        width - 1u, output, rows, input_tensor));
+    for (size_t offset = 0; offset < input_values; offset += output_values) {
+        const size_t remaining = input_values - offset;
+        const size_t count = remaining < output_values ? remaining : output_values;
+        CHECK(ds4_gpu_tensor_read(input_tensor, offset * sizeof(float), got, count * sizeof(float)));
+        CHECK(!memcmp(got, input + offset, count * sizeof(float)));
+    }
+    fprintf(stderr, "Q8 BF16 API exact %zu outputs; quality=%u wmma=%u\n", output_values, quality, wmma);
+    free(rounded); free(got); ds4_gpu_tensor_free(fused);
+    CHECK(!ds4_gpu_dsv41_q8_projection_rows(output_tensor, model, weight_bytes - 1u, 0,
+        width, output, rows, input_tensor));
+    CHECK(!ds4_gpu_dsv41_q8_projection_rows(output_tensor, model, weight_bytes, 0,
+        width, output, rows + 1u, input_tensor));
+    ds4_gpu_tensor_free(output_tensor);
+    ds4_gpu_tensor_free(input_tensor);
+    ds4_gpu_cleanup();
+    free(model); free(input); free(actual);
+    return ds4_gpu_init();
+}
+
+static int check_q8_attention_pair(void) {
+    const uint32_t rows = requested_shape % 6u + 1u;
+    ds4_gpu_set_quality(requested_shape >= 6u);
+    enum { WIDTH=5120, NQ=1280, NK=512, TERMS=8 };
+    const size_t rb = (WIDTH / 32u) * sizeof(fixture_q8), bytes = (NQ + NK) * rb;
+    void *model = NULL;
+    CHECK(!posix_memalign(&model, (size_t)sysconf(_SC_PAGESIZE), bytes));
+    memset(model, 0, bytes);
+    fixture_q8 *weights = model;
+    for (uint32_t o=0; o<NQ+NK; o++) for (uint32_t j=0; j<TERMS; j++) {
+        uint32_t column=q8_prefill_column(o,j,WIDTH);
+        fixture_q8 *block=&weights[(size_t)o*(WIDTH/32u)+column/32u];
+        block->scale=0x2000;block->q[column%32u]=(int8_t)q8_prefill_coefficient(o,j);
+    }
+    const size_t nx=(size_t)WIDTH*rows,nq=(size_t)NQ*rows,nk=(size_t)NK*rows;
+    float *input=malloc(nx*4),*actual=malloc(nq*4),*expected=malloc(nq*4),*input_copy=malloc(nx*4);
+    CHECK(input&&actual&&expected&&input_copy);
+    for(size_t i=0;i<nx;i++)input[i]=random_value()+0.00012345f;
+    CHECK(ds4_gpu_set_model_map(model,bytes));
+    ds4_gpu_tensor *in=upload(input,nx*4),*q=upload(NULL,nq*4),*kv=upload(NULL,nk*4);
+    ds4_gpu_tensor *reference=upload(NULL,nq*4);
+    CHECK(in&&q&&kv&&reference);
+    RUN(ds4_gpu_dsv41_q8_attention_pair_bf16(q,kv,model,bytes,0,NQ*rb,rows,in));
+    for(unsigned part=0;part<2;part++) {
+        uint32_t n=part?NK:NQ;size_t values=(size_t)n*rows,offset=part?NQ*rb:0;
+        RUN(ds4_gpu_dsv41_q8_projection_rows(reference,model,bytes,offset,WIDTH,n,rows,in));
+        RUN(ds4_gpu_dsv41_quantize(reference,n,rows,DS4_V41_BF16));
+        CHECK(ds4_gpu_tensor_read(reference,0,expected,values*4));
+        CHECK(ds4_gpu_tensor_read(part?kv:q,0,actual,values*4));
+        CHECK(!memcmp(expected,actual,values*4));
+    }
+    CHECK(!ds4_gpu_dsv41_q8_attention_pair_bf16(q,kv,model,bytes-1,0,NQ*rb,rows,in));
+    CHECK(!ds4_gpu_dsv41_q8_attention_pair_bf16(q,kv,model,bytes,UINT64_MAX,NQ*rb,rows,in));
+    CHECK(!ds4_gpu_dsv41_q8_attention_pair_bf16(q,kv,model,bytes,0,NQ*rb,0,in));
+    CHECK(!ds4_gpu_dsv41_q8_attention_pair_bf16(q,kv,model,bytes,0,NQ*rb,7,in));
+    CHECK(!ds4_gpu_dsv41_q8_attention_pair_bf16(q,q,model,bytes,0,NQ*rb,rows,in));
+    CHECK(!ds4_gpu_dsv41_q8_attention_pair_bf16(in,kv,model,bytes,0,NQ*rb,rows,in));
+    CHECK(!ds4_gpu_dsv41_q8_attention_pair_bf16(q,in,model,bytes,0,NQ*rb,rows,in));
+    CHECK(!ds4_gpu_dsv41_q8_attention_pair_bf16(NULL,kv,model,bytes,0,NQ*rb,rows,in));
+    ds4_gpu_tensor *short_q=ds4_gpu_tensor_view(q,0,nq*4-1);
+    CHECK(short_q);
+    CHECK(!ds4_gpu_dsv41_q8_attention_pair_bf16(short_q,kv,model,bytes,0,NQ*rb,rows,in));
+    ds4_gpu_tensor_free(short_q);
+    CHECK(ds4_gpu_tensor_read(in,0,input_copy,nx*4));CHECK(!memcmp(input,input_copy,nx*4));
+    CHECK(sync_guards());
+    fprintf(stderr,"Q8 pair API rows=%u quality=%u full_bitwise=1 guards=1 rejects=9\n",rows,requested_shape>=6u);
+    ds4_gpu_tensor_free(reference);ds4_gpu_tensor_free(q);ds4_gpu_tensor_free(kv);ds4_gpu_tensor_free(in);
+    ds4_gpu_cleanup();free(model);free(input);free(actual);free(expected);free(input_copy);
     return ds4_gpu_init();
 }
 
@@ -1221,6 +1511,51 @@ static int check_attention_output(void) {
     return ds4_gpu_init();
 }
 
+/* Actual fused API versus native weighted normalization plus BF16. */
+static int check_norm_bf16_api(void) {
+    const unsigned shape=requested_shape/6, mode=(requested_shape/2)%3, alias=requested_shape%2;
+    const unsigned widths[]={512,1280,5120}, counts[]={1,2,4,6,128,2048}, tails[]={1,255,257,5119};
+    CHECK(shape<22);
+    const unsigned n=shape<18?widths[shape/6]:tails[shape-18];
+    const unsigned rows=shape<18?counts[shape%6]:7;
+    const size_t values=(size_t)n*rows, bytes=values*sizeof(float);
+    const float eps=mode==2?0:1e-6f;
+    float *x=malloc(bytes),*w=malloc(n*sizeof(float)),*raw=malloc(bytes),*a=malloc(bytes),*b=malloc(bytes);
+    CHECK(x&&w&&raw&&a&&b);
+    for(size_t i=0;i<values;i++) x[i]=mode==1?0:mode==2?(i%2?-1:1):random_value()*4;
+    for(unsigned i=0;i<n;i++) w[i]=mode==2?((int)(i%2049)-1024)/1024.0f:random_value()*4;
+    ds4_gpu_tensor *in=upload(x,bytes),*base=upload(x,bytes),*fused=upload(x,bytes);
+    CHECK(in&&base&&fused);
+    RUN(ds4_gpu_rms_norm_weight_rows_tensor(base,alias?base:in,w,n*sizeof(float),0,n,rows,eps));
+    CHECK(ds4_gpu_tensor_read(base,0,raw,bytes));
+    RUN(ds4_gpu_dsv41_quantize(base,n,rows,DS4_V41_BF16));
+    RUN(ds4_gpu_dsv41_norm(fused,alias?fused:in,w,n*sizeof(float),0,n,rows,eps));
+    CHECK(ds4_gpu_tensor_read(base,0,a,bytes));CHECK(ds4_gpu_tensor_read(fused,0,b,bytes));
+    CHECK(!memcmp(a,b,bytes));
+    for(unsigned row=0;row<rows;row++) {
+        double sum=0;for(unsigned j=0;j<n;j++){double v=x[(size_t)row*n+j];sum+=v*v;}
+        const double scale=1/sqrt(sum/n+eps);
+        for(unsigned j=0;j<n;j++) {
+            const size_t i=(size_t)row*n+j;const float rounded=bf16(raw[i]);
+            CHECK(!memcmp(a+i,&rounded,sizeof(float)));
+            const double expected=(double)x[i]*scale*w[j];
+            CHECK(isfinite(raw[i]) && fabs(raw[i]-expected)<=2e-6*(1+fabs(expected)));
+            if(mode==2){const float exact=bf16(x[i]*w[j]);CHECK(!memcmp(a+i,&exact,sizeof(float)));}
+        }
+    }
+    CHECK(ds4_gpu_tensor_read(in,0,b,bytes));CHECK(!memcmp(b,x,bytes));
+    CHECK(!ds4_gpu_dsv41_norm(fused,in,w,n*sizeof(float)-1,0,n,rows,eps));
+    CHECK(!ds4_gpu_dsv41_norm(fused,in,w,n*sizeof(float),UINT64_MAX,n,rows,eps));
+    CHECK(!ds4_gpu_dsv41_norm(fused,in,w,n*sizeof(float),0,n,rows+1,eps));
+    CHECK(!ds4_gpu_dsv41_norm(NULL,in,w,n*sizeof(float),0,n,rows,eps));
+    CHECK(!ds4_gpu_dsv41_norm(fused,NULL,w,n*sizeof(float),0,n,rows,eps));
+    CHECK(!ds4_gpu_dsv41_norm(fused,in,NULL,n*sizeof(float),0,n,rows,eps));
+    CHECK(sync_guards());CHECK(ds4_gpu_tensor_read(fused,0,b,bytes));CHECK(!memcmp(b,a,bytes));
+    fprintf(stderr,"PASS norm BF16 API width=%u rows=%u mode=%u alias=%u values=%zu; exact/native/independent oracle/guards/rejects\n",n,rows,mode,alias,values);
+    ds4_gpu_tensor_free(in);ds4_gpu_tensor_free(base);ds4_gpu_tensor_free(fused);
+    free(x);free(w);free(raw);free(a);free(b);return 1;
+}
+
 typedef struct { const char *name; unsigned shapes; int (*run)(void); } test_case;
 static const test_case cases[] = {
     {"quantization", 4, check_quantization},
@@ -1228,6 +1563,7 @@ static const test_case cases[] = {
     {"pool", 8, check_pool},
     {"candidates", 7, check_candidates},
     {"bf16", 13, check_bf16_boundaries},
+    {"norm-bf16-api",132,check_norm_bf16_api},
     {"rope", 16, check_rope},
     {"gather", 7, check_sparse_gather},
     {"carry", 16, check_compact_carry},
@@ -1235,11 +1571,15 @@ static const test_case cases[] = {
     {"indexer", 16, check_indexer_scores},
     {"dspark-hc", 3, check_dspark_hc_mean},
     {"dspark-router", 1, check_dspark_router},
-    {"dspark-markov", 3, check_dspark_markov},
+    {"dspark-markov", 4, check_dspark_markov},
     {"projection", 28, check_projection},
     {"f32-projection", 13, check_f32_projection},
+    {"router-packed-cache", 1, check_router_packed_cache},
     {"hc", 4, check_hc_scaled},
     {"q8-prefill-projection", 28, check_q8_prefill_projection},
+    {"q8-attention-pair", 12, check_q8_attention_pair},
+    {"q8-bf16-projection", 68, check_q8_bf16_projection},
+    {"q8-small-bf16", 72, check_q8_small_bf16_projection},
     {"attention-output", 6, check_attention_output},
 };
 

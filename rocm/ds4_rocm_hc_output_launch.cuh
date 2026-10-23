@@ -441,3 +441,27 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
                                                     n_embd, n_hc,
                                                     "q8_hc_expand");
 }
+
+/* Experimental explicit V4.1 operators. The existing engine calls remain unchanged. */
+extern "C" int ds4_gpu_dsv41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *weights, uint32_t width, uint32_t rows, uint32_t stride) {
+    const uint64_t count=(uint64_t)width*rows;
+    if (!width || !rows || (stride!=4u && stride!=24u) ||
+        (count+255u)/256u>INT32_MAX || !cuda_tensor_has_f32(out,count) ||
+        !cuda_tensor_has_f32(x,count*4u) ||
+        !cuda_tensor_has_f32(weights,(uint64_t)(rows-1u)*stride+4u)) return 0;
+    v41_hc_weighted_sum_bf16_kernel<<<(count+255u)/256u,256>>>(
+        (float*)out->ptr,(const float*)x->ptr,(const float*)weights->ptr,width,4u,rows,stride);
+    return cuda_ok(cudaGetLastError(),"V4.1 HC sum/BF16");
+}
+extern "C" int ds4_gpu_dsv41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split, uint32_t width, uint32_t rows) {
+    const uint64_t count=(uint64_t)width*rows;
+    if (!width || !rows || count>(uint64_t)INT32_MAX*64u ||
+        !cuda_tensor_has_f32(out,count*4u) || !cuda_tensor_has_f32(residual,count*4u) ||
+        !cuda_tensor_has_f32(block,count) || !cuda_tensor_has_f32(split,(uint64_t)rows*24u)) return 0;
+    v41_hc_expand4_bf16_kernel<<<(count+255u)/256u,256>>>(
+        (float*)out->ptr,(const float*)block->ptr,(const float*)residual->ptr,
+        (const float*)split->ptr,width,rows);
+    return cuda_ok(cudaGetLastError(),"V4.1 HC expansion/BF16");
+}

@@ -140,10 +140,10 @@ static int run(unsigned n,unsigned rank,unsigned mode) {
     ds4_gpu_tensor *gt=upload(scratch,nmid*4),*ut=upload(scratch,nmid*4),*mt=upload(scratch,nmid*4),*dt=upload(NULL,pairs*M*4),*ot=upload(NULL,ny*4);CHECK(it&&wt&&xt&&gt&&ut&&mt&&dt&&ot);
     if(mode==4 || mode==5) {
         ids[0]=mode==4?-1:384;CHECK(ds4_gpu_tensor_write(it,0,ids,pairs*4));
-        CHECK(!ds4_gpu_dsv41_routed_moe_tp_tensor(ot,gt,ut,mt,dt,model,wb,0,table,2*table,it,wt,xt,n,rank));
+        CHECK(!ds4_gpu_dsv41_routed_moe_tp_tensor(ot,gt,ut,mt,dt,model,wb,0,table,2*table,it,wt,xt,n,rank,false));
         CHECK(sync_guards());puts("Invalid global expert ID rejected PASS");goto cleanup;
     }
-    RUN(ds4_gpu_dsv41_routed_moe_tp_tensor(ot,gt,ut,mt,dt,model,wb,0,table,2*table,it,wt,xt,n,rank));
+    RUN(ds4_gpu_dsv41_routed_moe_tp_tensor(ot,gt,ut,mt,dt,model,wb,0,table,2*table,it,wt,xt,n,rank,false));
     CHECK(ds4_gpu_tensor_read(ot,0,got,ny*4));
     if(mode==6)got[0]+=1.f; /* Deliberate oracle corruption must fail. */
     size_t failures=0;double worst=0;

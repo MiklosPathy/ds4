@@ -371,3 +371,56 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         norm_out[(uint64_t)t * n_embd + col] = v * norm_scale * norm_w[col];
     }
 }
+
+
+/* Same ordered HC arithmetic, with the existing V4.1 BF16 store boundary. */
+__device__ static float v41_hc_bf16_round(float x) {
+    uint32_t bits=__float_as_uint(x);
+    if ((bits&0x7f800000u)!=0x7f800000u) bits+=0x7fffu+((bits>>16u)&1u);
+    return __uint_as_float(bits&0xffff0000u);
+}
+__global__ static void v41_hc_weighted_sum_bf16_kernel(float *out, const float *x, const float *w, uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens, uint32_t weight_stride_f32) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_embd * n_tokens;
+    if (gid >= n) return;
+    uint32_t d = gid % n_embd;
+    uint32_t t = gid / n_embd;
+    float acc = 0.0f;
+    for (uint32_t h = 0; h < n_hc; h++) {
+        acc += x[(uint64_t)t * n_hc * n_embd + (uint64_t)h * n_embd + d] *
+               w[(uint64_t)t * weight_stride_f32 + h];
+    }
+    out[(uint64_t)t * n_embd + d] = v41_hc_bf16_round(acc);
+}
+__global__ static void v41_hc_expand4_bf16_kernel(
+        float *out_hc,
+        const float *block_out,
+        const float *residual_hc,
+        const float *split,
+        uint32_t n_embd,
+        uint32_t n_tokens) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * n_embd;
+    if (gid >= n) return;
+    const uint32_t d = gid % n_embd;
+    const uint32_t t = gid / n_embd;
+    const uint64_t td = (uint64_t)t * n_embd + d;
+    const uint64_t hc_base = (uint64_t)t * 4u * n_embd + d;
+    const float bv = block_out[td];
+    const float r0 = residual_hc[hc_base + 0u * (uint64_t)n_embd];
+    const float r1 = residual_hc[hc_base + 1u * (uint64_t)n_embd];
+    const float r2 = residual_hc[hc_base + 2u * (uint64_t)n_embd];
+    const float r3 = residual_hc[hc_base + 3u * (uint64_t)n_embd];
+    const float *sp = split + (uint64_t)t * 24u;
+    const float *post = sp + 4u;
+    const float *comb = sp + 8u;
+#pragma unroll
+    for (uint32_t dst = 0; dst < 4u; dst++) {
+        float acc = bv * post[dst];
+        acc += comb[0u * 4u + dst] * r0;
+        acc += comb[1u * 4u + dst] * r1;
+        acc += comb[2u * 4u + dst] * r2;
+        acc += comb[3u * 4u + dst] * r3;
+        out_hc[hc_base + (uint64_t)dst * n_embd] = v41_hc_bf16_round(acc);
+    }
+}

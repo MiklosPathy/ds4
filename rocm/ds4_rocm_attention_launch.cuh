@@ -756,6 +756,28 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                             n_head, head_dim);
                         return cuda_ok(cudaGetLastError(), "Halo direct QK indexed launch");
                     }
+                    const char *split_env=getenv("DS4_ROCM_ATTN_VERIFIER_SPLIT");
+                    if (g_deepseek41_model && ds4_rocm_is_gfx1151() && split_env &&
+                        (strcmp(split_env,"1")==0 || strcmp(split_env,"2")==0) && n_tokens>=2 && n_tokens<=6 &&
+                        (n_head==32 || n_head==64) && top_k==512 && n_raw<=256) {
+                        const bool actual_input_choice = strcmp(split_env,"2")==0 && n_head==64 && n_tokens>=3;
+                        const uint32_t splits=(actual_input_choice || n_tokens*((n_head+31)/32)>=12)?4:8;
+                        const uint64_t ph=(uint64_t)n_tokens*splits*n_head;
+                        float *parts=(float*)cuda_tmp_alloc(ph*514*sizeof(float),"V4.1 split verifier attention");
+                        if(!parts)return 0;
+                        float *stats=parts+ph*512;
+#define DS41_ATTN_SPLIT(N) do { \
+                        attention_mixed_heads16_wmma_kernel<1,32,true,N><<<dim3(n_tokens,(n_head+31)/32,N),512>>>( \
+                            parts,sinks,(const float*)q->ptr,(const float*)raw_kv->ptr,(const float*)comp_kv->ptr, \
+                            topk_ptr,n_tokens,pos0,n_raw,raw_cap,raw_start,n_comp,top_k,window,ratio,n_head,head_dim,stats); \
+                        if(!cuda_ok(cudaGetLastError(),"V4.1 verifier attention split"))return 0; \
+                        ds41_attention_verifier_split_combine<N><<<dim3(n_head,n_tokens),256>>>( \
+                            (float*)heads->ptr,parts,stats,n_head); \
+                        } while(0)
+                        if(splits==4){DS41_ATTN_SPLIT(4);}else{DS41_ATTN_SPLIT(8);}
+#undef DS41_ATTN_SPLIT
+                        return cuda_ok(cudaGetLastError(),"V4.1 verifier attention combine");
+                    }
                     attention_mixed_heads16_wmma_kernel<1, 32, true><<<grid, 512>>>((float *)heads->ptr,
                                                                             sinks,
                                                                             (const float *)q->ptr,

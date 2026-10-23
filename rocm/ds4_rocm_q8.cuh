@@ -677,7 +677,10 @@ typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
  * into LDS as f16, while each wave owns 16 output rows and computes four
  * 16-token WMMA columns.  It is opt-in from host code because it only wins once
  * the token batch is large enough to amortize the bigger tile. */
-template <uint32_t M_TILE, uint32_t WARPS, uint32_t PAD=0>
+/* Defined by the V4.1 primitives included later in this translation unit. */
+__device__ static float v41_bf16(float x);
+
+template <uint32_t M_TILE, uint32_t WARPS, uint32_t PAD=0, bool ROUND_BF16=false>
 __launch_bounds__(WARPS * 32u, 1)
 __global__ static void matmul_q8_0_f32_batch_wmma_rowtile_kernel(
         float *out,
@@ -780,7 +783,7 @@ __global__ static void matmul_q8_0_f32_batch_wmma_rowtile_kernel(
 #pragma unroll
         for (uint32_t j = 0; j < 8u; j++) {
             const uint32_t row = warp_m + 2u * j + (lane >> 4u);
-            if (row < out_dim) out[(uint64_t)tok * out_dim + row] = acc[j];
+            if (row < out_dim) out[(uint64_t)tok * out_dim + row] = ROUND_BF16 ? v41_bf16(acc[j]) : acc[j];
         }
     }
 }

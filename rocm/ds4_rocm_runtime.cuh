@@ -5353,6 +5353,80 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
     return 0;
 }
 
+/* Optional lossless router storage. Keys include both model and device range;
+ * target/drafter offsets can coincide. Original F32 weights remain available. */
+struct v41_router_packed_range {
+    const void *model, *original;
+    uint64_t model_size, offset;
+    uint32_t outputs;
+    bool striped;
+    void *device;
+    uint64_t bytes;
+};
+static std::vector<v41_router_packed_range> g_v41_router_packed;
+static uint64_t g_v41_router_packed_bytes;
+static __global__ void v41_router_pack_kernel(uint16_t *out, uint32_t *bad,
+        const float *weights, uint32_t count, bool striped) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t bits = __float_as_uint(weights[i]);
+    if ((bits & 0xffffu) || (bits & 0x7f800000u) == 0x7f800000u) atomicOr(bad,1u);
+    const uint32_t row=i/5120u, col=i%5120u;
+    const uint32_t packed = striped ?
+        (row*5u+col/1024u)*1024u+(col%256u)*4u+(col/256u)%4u : i;
+    out[packed] = (uint16_t)(bits >> 16);
+}
+static void v41_router_packed_clear(void) {
+    for (const auto &r : g_v41_router_packed) if (r.device) (void)cudaFree(r.device);
+    g_v41_router_packed.clear(); g_v41_router_packed_bytes=0;
+}
+static const void *v41_router_packed_get(const void *model, uint64_t model_size,
+        uint64_t offset, const float *weights, uint32_t outputs, bool striped, bool *failed) {
+    *failed=false;
+    const char *enabled=getenv("DS4_ROCM_V41_ROUTER_PACKED");
+    if ((enabled && strcmp(enabled,"1")) || !ds4_rocm_is_gfx1151() ||
+        (outputs!=128u && outputs!=384u)) return nullptr;
+    for (const auto &r : g_v41_router_packed)
+        if (r.model==model && r.original==weights && r.model_size==model_size &&
+            r.offset==offset && r.outputs==outputs && r.striped==striped) return r.device;
+    const uint32_t count=outputs*5120u;
+    const uint64_t bytes=(uint64_t)count*2u+4u, limit=384ull*1024u*1024u;
+    if (g_v41_router_packed.size()>=96u || bytes>limit-g_v41_router_packed_bytes) return nullptr;
+    void *packed=nullptr; uint32_t invalid=1;
+    cudaError_t error=cudaMalloc(&packed,(size_t)bytes);
+    // Allocation pressure may fall back; execution errors must remain errors.
+    if (error!=cudaSuccess && error!=hipErrorOutOfMemory) {
+        cuda_ok(error,"router packed allocation"); *failed=true; return nullptr;
+    }
+    if (error==hipErrorOutOfMemory) (void)cudaGetLastError();
+    if (error==cudaSuccess) {
+        uint32_t *bad=(uint32_t *)((char *)packed+bytes-4u);
+        error=cudaMemset(bad,0,4u);
+        if (error==cudaSuccess) {
+            v41_router_pack_kernel<<<(count+255u)/256u,256u>>>((uint16_t *)packed,bad,weights,count,striped);
+            error=cudaGetLastError();
+        }
+        if (error==cudaSuccess) error=cudaMemcpy(&invalid,bad,4u,cudaMemcpyDeviceToHost);
+        if (error!=cudaSuccess) {
+            cuda_ok(error,"router packed preparation");
+            (void)cudaFree(packed); *failed=true; return nullptr;
+        }
+    }
+    if (error!=cudaSuccess || invalid) {
+        if (packed) (void)cudaFree(packed);
+        packed=nullptr;
+    } else g_v41_router_packed_bytes+=bytes;
+    g_v41_router_packed.push_back({model,weights,model_size,offset,outputs,striped,packed,packed?bytes:0u});
+    const char *trace=getenv("DS4_ROCM_V41_ROUTER_PACK_TRACE");
+    if (trace && !strcmp(trace,"1"))
+        fprintf(stderr,DS4_GPU_LOG_PREFIX "router packed outputs=%u striped=%u usable=%u bytes=%llu total=%llu\n",
+            outputs,(unsigned)striped,(unsigned)(packed!=nullptr),
+            (unsigned long long)(packed?bytes:0u),(unsigned long long)g_v41_router_packed_bytes);
+    return packed;
+}
+
+#include "ds4_rocm_engram_e4m3_cache.cuh"
+
 static void cuda_q8_f16_cache_release_all(void) {
     for (const cuda_q8_f16_transpose_range &r : g_q8_f16_transpose_ranges) {
         (void)cudaFree(r.device_ptr);
@@ -6454,7 +6528,72 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
     return 1;
 }
 
+/* Immutable small-row TP expert tables. The caller retains its final drain. */
+struct v41_tp_pointer_entry {
+    const void *model;
+    uint64_t model_size, gate_offset, up_offset, down_offset;
+    uint32_t rank;
+    const char *gate, *up, *down;
+    void *table;
+};
+static std::vector<v41_tp_pointer_entry> g_v41_tp_pointer_cache;
+static void v41_tp_pointer_cache_clear(void) {
+    for (const auto &entry : g_v41_tp_pointer_cache) (void)cudaFree(entry.table);
+    g_v41_tp_pointer_cache.clear();
+}
+static const char *const *v41_tp_pointer_cache_get(const void *model,
+        uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t down_offset, uint32_t rank, const char *gate,
+        const char *up, const char *down, bool *failed) {
+    *failed = false;
+    const char *enabled = getenv("DS4_ROCM_V41_TP_POINTER_CACHE");
+    if ((enabled && strcmp(enabled, "1")) || !ds4_rocm_is_gfx1151() ||
+        !model || rank > 1u || !gate || !up || !down) return nullptr;
+    for (const auto &entry : g_v41_tp_pointer_cache) {
+        if (entry.model == model && entry.model_size == model_size &&
+            entry.gate_offset == gate_offset && entry.up_offset == up_offset &&
+            entry.down_offset == down_offset && entry.rank == rank &&
+            entry.gate == gate && entry.up == up && entry.down == down)
+            return (const char *const *)entry.table;
+    }
+    if (g_v41_tp_pointer_cache.size() >= 96u) return nullptr;
+    constexpr uint32_t experts = 384u, owned = 192u;
+    constexpr uint64_t gate_stride = UINT64_C(1320) * 2304u;
+    constexpr uint64_t down_stride = UINT64_C(756) * 5120u;
+    const char *tables[3][experts] = {};
+    for (uint32_t i = 0; i < owned; ++i) {
+        tables[0][rank * owned + i] = gate + i * gate_stride;
+        tables[1][rank * owned + i] = up + i * gate_stride;
+        tables[2][rank * owned + i] = down + i * down_stride;
+    }
+    void *table = nullptr;
+    cudaError_t error = cudaMalloc(&table, sizeof(tables));
+    if (error == hipErrorOutOfMemory) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    if (!cuda_ok(error, "TP pointer cache allocation")) {
+        *failed = true;
+        return nullptr;
+    }
+    error = cudaMemcpy(table, tables, sizeof(tables), cudaMemcpyHostToDevice);
+    if (!cuda_ok(error, "TP pointer cache upload")) {
+        (void)cudaFree(table);
+        *failed = true;
+        return nullptr;
+    }
+    g_v41_tp_pointer_cache.push_back({model, model_size, gate_offset, up_offset,
+        down_offset, rank, gate, up, down, table});
+    const char *trace = getenv("DS4_ROCM_V41_TP_POINTER_CACHE_TRACE");
+    if (trace && !strcmp(trace, "1"))
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "TP pointer cache rank=%u entries=%zu bytes=%zu\n",
+            rank, g_v41_tp_pointer_cache.size(), g_v41_tp_pointer_cache.size() * sizeof(tables));
+    return (const char *const *)table;
+}
+
 static void cuda_model_range_release_ranges_only(void) {
+    ds41_engram_e4m3::clear();
+    v41_tp_pointer_cache_clear();
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
@@ -6473,6 +6612,7 @@ static void cuda_model_range_release_ranges_only(void) {
 }
 
 static void cuda_model_range_release_all(void) {
+    v41_router_packed_clear();
     cuda_model_range_release_ranges_only();
     g_stream_selected_cache.loaded = 0;
     cuda_stream_resident_cache_release();

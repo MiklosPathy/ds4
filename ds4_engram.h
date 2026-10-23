@@ -69,6 +69,12 @@ typedef struct ds4_engram_reader ds4_engram_reader;
 ds4_engram_reader *ds4_engram_reader_create(void);
 bool ds4_engram_reader_start(ds4_engram_reader *reader,
     const ds4_engram_table tables[2], const uint32_t ids[2][DS4_ENGRAM_COLS], float *out);
+/* Bounded verifier block. IDs are [token][table][COLS]; output is
+ * [table][token][COLS][DIM]. One owner; wait(table1) or free before releasing
+ * output or descriptors, including when table0 fails. No row cache. */
+enum { DS4_ENGRAM_READER_MAX_TOKENS = 6 };
+bool ds4_engram_reader_start_batch(ds4_engram_reader *reader,
+    const ds4_engram_table tables[2], const uint32_t *ids, unsigned tokens, float *out);
 bool ds4_engram_reader_wait(ds4_engram_reader *reader, unsigned table);
 void ds4_engram_reader_free(ds4_engram_reader *reader);
 

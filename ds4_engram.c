@@ -387,7 +387,8 @@ struct ds4_engram_reader {
     unsigned completed[2];
     int errors[2];
     ds4_engram_table tables[2];
-    uint32_t ids[2][DS4_ENGRAM_COLS];
+    uint32_t ids[2][DS4_ENGRAM_READER_MAX_TOKENS * DS4_ENGRAM_COLS];
+    unsigned tokens;
     float *out;
 };
 
@@ -403,10 +404,11 @@ static void *read_token_thread(void *context) {
         seen = r->generation;
         pthread_mutex_unlock(&r->mutex);
         for (unsigned table = 0; table < 2; table++) {
-            const unsigned first = index * DS4_ENGRAM_COLS / TOKEN_READERS;
-            const unsigned end = (index + 1u) * DS4_ENGRAM_COLS / TOKEN_READERS;
+            const unsigned count = r->tokens * DS4_ENGRAM_COLS;
+            const unsigned first = index * count / TOKEN_READERS;
+            const unsigned end = (index + 1u) * count / TOKEN_READERS;
             const bool ok = ds4_engram_read(&r->tables[table], r->ids[table] + first,
-                end - first, r->out + (table * DS4_ENGRAM_COLS + first) * DS4_ENGRAM_DIM);
+                end - first, r->out + (table * count + first) * DS4_ENGRAM_DIM);
             const int error = ok ? 0 : errno ? errno : EIO;
             pthread_mutex_lock(&r->mutex);
             if (!r->errors[table]) r->errors[table] = error;
@@ -456,13 +458,14 @@ fail:
     return NULL;
 }
 
-bool ds4_engram_reader_start(ds4_engram_reader *r,
-    const ds4_engram_table tables[2], const uint32_t ids[2][DS4_ENGRAM_COLS], float *out) {
-    if (!r || !tables || !ids || !out) { errno = EINVAL; return false; }
+bool ds4_engram_reader_start_batch(ds4_engram_reader *r,
+    const ds4_engram_table tables[2], const uint32_t *ids, unsigned tokens, float *out) {
+    if (!r || !tables || !ids || !out || !tokens || tokens > DS4_ENGRAM_READER_MAX_TOKENS) { errno = EINVAL; return false; }
     for (unsigned t = 0; t < 2; t++) {
         if (tables[t].fd < 0) { errno = EINVAL; return false; }
-        for (unsigned col = 0; col < DS4_ENGRAM_COLS; col++)
-            if (ids[t][col] >= tables[t].rows) { errno = EINVAL; return false; }
+        for (unsigned i = 0; i < tokens; i++)
+            for (unsigned col = 0; col < DS4_ENGRAM_COLS; col++)
+            if (ids[(i * 2u + t) * DS4_ENGRAM_COLS + col] >= tables[t].rows) { errno = EINVAL; return false; }
     }
     pthread_mutex_lock(&r->mutex);
     if (r->active || r->shutdown) {
@@ -471,7 +474,10 @@ bool ds4_engram_reader_start(ds4_engram_reader *r,
         return false;
     }
     memcpy(r->tables, tables, sizeof(r->tables));
-    memcpy(r->ids, ids, sizeof(r->ids));
+    for (unsigned t = 0; t < 2; t++)
+        for (unsigned i = 0; i < tokens; i++)
+            memcpy(r->ids[t] + i * DS4_ENGRAM_COLS, ids + (i * 2u + t) * DS4_ENGRAM_COLS, DS4_ENGRAM_COLS * sizeof(uint32_t));
+    r->tokens = tokens;
     memset(r->errors, 0, sizeof(r->errors));
     r->out = out;
     memset(r->completed, 0, sizeof(r->completed));
@@ -480,6 +486,11 @@ bool ds4_engram_reader_start(ds4_engram_reader *r,
     pthread_cond_broadcast(&r->work);
     pthread_mutex_unlock(&r->mutex);
     return true;
+}
+
+bool ds4_engram_reader_start(ds4_engram_reader *r,
+    const ds4_engram_table tables[2], const uint32_t ids[2][DS4_ENGRAM_COLS], float *out) {
+    return ds4_engram_reader_start_batch(r, tables, (const uint32_t *)ids, 1u, out);
 }
 
 bool ds4_engram_reader_wait(ds4_engram_reader *r, unsigned table) {

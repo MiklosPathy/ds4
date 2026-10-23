@@ -988,6 +988,8 @@ __global__ static void engram_lds_token_reuse(float *out,const __half *w,const f
     }
 }
 
+#include "ds4_rocm_engram_e4m3.cuh"
+
 /* Engram table scales can exceed F16 range. Only use the matrix path when
  * every activation survives conversion exactly; retain F32 input otherwise. */
 __global__ static void v41_engram_pack_checked_kernel(__half *out,
@@ -1053,6 +1055,34 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
         !cuda_u64_mul3_checked(width, outputs, sizeof(uint16_t), &weight_bytes) ||
         !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
         !cuda_tensor_has_elems2(in, width, rows, 4u) || !cuda_tensor_has_elems2(out, outputs, rows, 4u)) return 0;
+    if (width == 6144u && outputs == 25600u && rows <= 6u &&
+        ds41_engram_e4m3::enabled() && !cuda_runtime_config()->graph_dump) {
+        const __half *w = (const __half *)cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes, "V4.1 exact Engram F16");
+        if (!w) return 0;
+        bool failed = false;
+        const auto *packed = ds41_engram_e4m3::get(model_map, model_size, weight_offset, w, &failed);
+        if (failed) return 0;
+        if (packed) {
+            const uint8_t *codes = (const uint8_t *)packed->device;
+            const int32_t *scales = (const int32_t *)(codes + ds41_engram_e4m3::count);
+            switch (rows) {
+            case 1u: ds41_engram_e4m3::e4m3_scalar<<<800u, 1024u, 24576u>>>(
+                (float *)out->ptr, codes, scales, (const float *)in->ptr, 6144u, 25600u); break;
+            case 2u: ds41_engram_e4m3::e4m3_tiny<2,2,768><<<12800u, 64u>>>(
+                (float *)out->ptr, codes, scales, (const float *)in->ptr); break;
+            case 3u: ds41_engram_e4m3::e4m3_tiny<3,4,1024><<<6400u, 128u>>>(
+                (float *)out->ptr, codes, scales, (const float *)in->ptr); break;
+            case 4u: ds41_engram_e4m3::e4m3_tiny<4,8,1024><<<3200u, 256u>>>(
+                (float *)out->ptr, codes, scales, (const float *)in->ptr); break;
+            case 5u: ds41_engram_e4m3::e4m3_tiny<5,4,1024><<<6400u, 128u>>>(
+                (float *)out->ptr, codes, scales, (const float *)in->ptr); break;
+            case 6u: ds41_engram_e4m3::e4m3_tiny<6,4,512><<<6400u, 128u>>>(
+                (float *)out->ptr, codes, scales, (const float *)in->ptr); break;
+            }
+            return cuda_ok(cudaGetLastError(), "V4.1 exact E4M3 Engram projection");
+        }
+    }
     if (width == 6144u && outputs == 25600u && rows >= 2u && rows <= 6u &&
         ds4_rocm_is_gfx1151() && !cuda_runtime_config()->graph_dump) {
         const __half *w = (const __half *)cuda_model_range_ptr(
@@ -1174,12 +1204,65 @@ __global__ static void v41_router_f32_rows_kernel(float *out, const float *weigh
     constexpr uint32_t width = 5120u;
     const uint32_t lane = threadIdx.x, row = blockIdx.x;
     float sum[TOKENS] = {};
+#pragma unroll 1
     for (uint32_t base = 0; base < 20u; base += 4u) {
         float w[4], x[TOKENS][4];
 #pragma unroll
         for (uint32_t u = 0; u < 4u; u++) {
             const uint32_t col = lane + (base + u) * 256u;
             w[u] = weights[(uint64_t)row * width + col];
+#pragma unroll
+            for (uint32_t t = 0; t < TOKENS; t++)
+                x[t][u] = t < rows ? input[(uint64_t)t * width + col] : 0.0f;
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < 4u; u++) {
+#pragma unroll
+            for (uint32_t t = 0; t < TOKENS; t++)
+                sum[t] = __fmaf_rn(w[u], x[t][u], sum[t]);
+        }
+    }
+    __shared__ float partial[TOKENS][256];
+#pragma unroll
+    for (uint32_t t = 0; t < TOKENS; t++) partial[t][lane] = sum[t];
+    __syncthreads();
+    for (uint32_t stride = 128u; stride >= 32u; stride >>= 1u) {
+        if (lane < stride) {
+#pragma unroll
+            for (uint32_t t = 0; t < TOKENS; t++)
+                partial[t][lane] += partial[t][lane + stride];
+        }
+        __syncthreads();
+    }
+    if (lane < 32u) {
+#pragma unroll
+        for (uint32_t t = 0; t < TOKENS; t++) {
+            float value = partial[t][lane];
+            for (uint32_t stride = 16u; stride; stride >>= 1u)
+                value += __shfl_down(value, stride, 32);
+            if (lane == 0u && t < rows) out[(uint64_t)t * outputs + row] = value;
+        }
+    }
+}
+
+template <uint32_t TOKENS, bool STRIPED>
+__global__ static void v41_router_packed_rows_kernel(float *out, const void *weights,
+        const float *input, uint32_t outputs, uint32_t rows) {
+    constexpr uint32_t width = 5120u;
+    const uint32_t lane = threadIdx.x, row = blockIdx.x;
+    float sum[TOKENS] = {};
+#pragma unroll 1
+    for (uint32_t base = 0; base < 20u; base += 4u) {
+        uint2 packed = {};
+        if constexpr (STRIPED) packed = ((const uint2 *)weights)[((uint64_t)row*5u+base/4u)*256u+lane];
+        float w[4], x[TOKENS][4];
+#pragma unroll
+        for (uint32_t u = 0; u < 4u; u++) {
+            const uint32_t col = lane + (base + u) * 256u;
+            if constexpr (STRIPED) {
+                const uint32_t word=u<2u?packed.x:packed.y;
+                w[u]=__uint_as_float((u&1u)?(word&0xffff0000u):(word<<16));
+            } else w[u]=__uint_as_float((uint32_t)((const uint16_t *)weights)[(uint64_t)row*width+col]<<16);
 #pragma unroll
             for (uint32_t t = 0; t < TOKENS; t++)
                 x[t][u] = t < rows ? input[(uint64_t)t * width + col] : 0.0f;
@@ -1228,6 +1311,19 @@ extern "C" int ds4_gpu_dsv41_f32_projection_rows(ds4_gpu_tensor *out,
     if (!w) return 0;
     if (ds4_rocm_is_gfx1151() && width == 5120u &&
         (outputs == 128u || outputs == 384u)) {
+        bool pack_failed=false;
+        const void *packed=v41_router_packed_get(model_map,model_size,weight_offset,w,outputs,rows>3u,&pack_failed);
+        if (pack_failed) return 0;
+        if (packed) {
+#define V41_ROUTER_PACKED(T,S) v41_router_packed_rows_kernel<T,S><<<outputs,256u>>>( \
+            (float *)out->ptr,packed,(const float *)in->ptr,outputs,rows)
+            if (rows==1u) { V41_ROUTER_PACKED(1u,false); }
+            else if (rows==2u) { V41_ROUTER_PACKED(2u,false); }
+            else if (rows==3u) { V41_ROUTER_PACKED(3u,false); }
+            else { V41_ROUTER_PACKED(6u,true); }
+#undef V41_ROUTER_PACKED
+            return cuda_ok(cudaGetLastError(),"V4.1 lossless packed router");
+        }
 #define V41_ROUTER_ROWS(T) v41_router_f32_rows_kernel<T><<<outputs, 256u>>>( \
         (float *)out->ptr, w, (const float *)in->ptr, outputs, rows)
         if (rows == 1u) { V41_ROUTER_ROWS(1u); }
@@ -1254,6 +1350,7 @@ extern "C" int ds4_gpu_hc_rms_scale_project_f16_tensor(ds4_gpu_tensor *out, ds4_
 /* Four input values per lane, four Q8 blocks per wave. Scalar V4.1
  * projections retain F32 activations; the block-wise reduction differs from
  * the original lane accumulation and is qualified independently. */
+template<bool ROUND_BF16 = false>
 __global__ static void v41_q8_f32_blocks4_kernel(float *out,
         const unsigned char *weights, const float *input,
         uint32_t width, uint32_t outputs, uint64_t row_bytes) {
@@ -1276,14 +1373,14 @@ __global__ static void v41_q8_f32_blocks4_kernel(float *out,
         acc += d * value;
     }
     acc = warp_sum_f32(acc);
-    if (lane == 0u) out[row] = acc;
+    if (lane == 0u) out[row] = ROUND_BF16 ? v41_bf16(acc) : acc;
 }
 
 /* DSpark verifies two to six consecutive rows.  Reuse each packed Q8 block
  * across all rows while preserving the scalar blocks4 lane ownership,
  * per-lane dot boundary and wave32 reduction tree.  GROUPS supports the
  * interleaved eight-group attention-A layout; dense projections use one. */
-template <uint32_t ROWS, uint32_t GROUPS = 1u>
+template <uint32_t ROWS, uint32_t GROUPS = 1u, bool ROUND_BF16 = false>
 __global__ __launch_bounds__(32) static void v41_q8_f32_tiny_rows_kernel(
         float *out, const unsigned char *weights, const float *input,
         uint32_t width, uint32_t rows_per_group, uint64_t row_bytes) {
@@ -1317,32 +1414,155 @@ __global__ __launch_bounds__(32) static void v41_q8_f32_tiny_rows_kernel(
 #pragma unroll
     for (uint32_t t = 0; t < ROWS; t++) {
         const float total = warp_sum_f32(acc[t]);
-        if (lane == 0u) out[(uint64_t)t * outputs + row] = total;
+        if (lane == 0u) out[(uint64_t)t * outputs + row] = ROUND_BF16 ? v41_bf16(total) : total;
     }
 }
 
-template <uint32_t GROUPS>
+template <uint32_t GROUPS, bool ROUND_BF16 = false>
 static int v41_q8_f32_tiny_rows_launch(float *out, const unsigned char *weights,
         const float *input, uint32_t width, uint32_t rows_per_group,
         uint32_t rows, uint64_t row_bytes) {
     const uint32_t outputs = rows_per_group * GROUPS;
     switch (rows) {
-        case 2u: v41_q8_f32_tiny_rows_kernel<2u, GROUPS><<<outputs, 32u>>>(
+        case 2u: v41_q8_f32_tiny_rows_kernel<2u, GROUPS, ROUND_BF16><<<outputs, 32u>>>(
             out, weights, input, width, rows_per_group, row_bytes); break;
-        case 3u: v41_q8_f32_tiny_rows_kernel<3u, GROUPS><<<outputs, 32u>>>(
+        case 3u: v41_q8_f32_tiny_rows_kernel<3u, GROUPS, ROUND_BF16><<<outputs, 32u>>>(
             out, weights, input, width, rows_per_group, row_bytes); break;
-        case 4u: v41_q8_f32_tiny_rows_kernel<4u, GROUPS><<<outputs, 32u>>>(
+        case 4u: v41_q8_f32_tiny_rows_kernel<4u, GROUPS, ROUND_BF16><<<outputs, 32u>>>(
             out, weights, input, width, rows_per_group, row_bytes); break;
-        case 5u: v41_q8_f32_tiny_rows_kernel<5u, GROUPS><<<outputs, 32u>>>(
+        case 5u: v41_q8_f32_tiny_rows_kernel<5u, GROUPS, ROUND_BF16><<<outputs, 32u>>>(
             out, weights, input, width, rows_per_group, row_bytes); break;
-        case 6u: v41_q8_f32_tiny_rows_kernel<6u, GROUPS><<<outputs, 32u>>>(
+        case 6u: v41_q8_f32_tiny_rows_kernel<6u, GROUPS, ROUND_BF16><<<outputs, 32u>>>(
             out, weights, input, width, rows_per_group, row_bytes); break;
         default: return 0;
     }
     return cuda_ok(cudaGetLastError(), "V4.1 tiny-row Q8 projection");
 }
 
-extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+template<bool ROUND>
+__global__ static void v41_pair_q8_scalar(float *out0, float *out1,
+        const unsigned char *weights0, const unsigned char *weights1, const float *input,
+        uint32_t width, uint32_t outputs0, uint32_t outputs1, uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t token = blockIdx.y;
+    const uint64_t global_row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    if (global_row >= (uint64_t)outputs0 + outputs1) return;
+    const bool second = global_row >= outputs0;
+    const uint64_t row = second ? global_row - outputs0 : global_row;
+    const uint32_t outputs = second ? outputs1 : outputs0;
+    float *out = second ? out1 : out0;
+    const unsigned char *weights = second ? weights1 : weights0;
+    input += (uint64_t)token * width;
+    out += (uint64_t)token * outputs;
+    const uint32_t blocks = width / 32u;
+    float acc = 0.0f;
+    for (uint32_t b = lane / 8u; b < blocks; b += 4u) {
+        const unsigned char *p = weights + row * row_bytes + (uint64_t)b * 34u;
+        const float d = q8_0_scale_scalar(p);
+        const uint32_t j = (lane & 7u) * 4u;
+        float value = 0.0f;
+#pragma unroll
+        for (uint32_t k = 0; k < 4u; k++)
+            value += (float)((const int8_t *)(p + 2u))[j + k] * input[b * 32u + j + k];
+        acc += d * value;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = ROUND ? v41_bf16(acc) : acc;
+}
+
+template <uint32_t ROWS, bool ROUND>
+__global__ __launch_bounds__(32) static void v41_pair_q8_tiny(
+        float *out0, float *out1, const unsigned char *weights0,
+        const unsigned char *weights1, const float *input,
+        uint32_t width, uint32_t outputs0, uint32_t outputs1, uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t global_row = blockIdx.x;
+    if (global_row >= outputs0 + outputs1) return;
+    const bool second = global_row >= outputs0;
+    const uint32_t row = second ? global_row - outputs0 : global_row;
+    const uint32_t rows_per_group = second ? outputs1 : outputs0;
+    float *out = second ? out1 : out0;
+    const unsigned char *weights = second ? weights1 : weights0;
+    const uint32_t group = row / rows_per_group;
+    const uint32_t outputs = rows_per_group * 1u;
+    const uint32_t blocks = width / 32u;
+    float acc[ROWS] = {};
+    for (uint32_t base = lane / 8u; base < blocks; base += 8u) {
+#pragma unroll
+        for (uint32_t u = 0; u < 2u; u++) {
+            const uint32_t b = base + 4u * u;
+            if (b >= blocks) continue;
+            const unsigned char *p = weights + (uint64_t)row * row_bytes +
+                                     (uint64_t)b * 34u;
+            const float scale = q8_0_scale_scalar(p);
+            const uint32_t j = (lane & 7u) * 4u;
+#pragma unroll
+            for (uint32_t t = 0; t < ROWS; t++) {
+                const float *x = input + ((uint64_t)t * 1u + group) * width +
+                                 (uint64_t)b * 32u + j;
+                float value = 0.0f;
+#pragma unroll
+                for (uint32_t k = 0; k < 4u; k++)
+                    value += (float)((const int8_t *)(p + 2u))[j + k] * x[k];
+                acc[t] += scale * value;
+            }
+        }
+    }
+#pragma unroll
+    for (uint32_t t = 0; t < ROWS; t++) {
+        const float total = warp_sum_f32(acc[t]);
+        if (lane == 0u) out[(uint64_t)t * outputs + row] = ROUND ? v41_bf16(total) : total;
+    }
+}
+
+static bool v41_q8_pair_overlap(const void *a, uint64_t an, const void *b, uint64_t bn) {
+    const uintptr_t ap = (uintptr_t)a, bp = (uintptr_t)b;
+    return ap <= bp ? bp - ap < an : ap - bp < bn;
+}
+
+extern "C" int ds4_gpu_dsv41_q8_attention_pair_bf16(
+        ds4_gpu_tensor *q, ds4_gpu_tensor *kv, const void *model_map,
+        uint64_t model_size, uint64_t q_offset, uint64_t kv_offset,
+        uint32_t rows, const ds4_gpu_tensor *in) {
+    const uint32_t width = 5120u, nq = 1280u, nk = 512u;
+    const uint64_t row_bytes = UINT64_C(160) * 34u;
+    if (!rows || rows > 6u || !model_map || !ds4_rocm_is_gfx1151() ||
+        !cuda_model_range_fits(model_size, q_offset, nq * row_bytes) ||
+        !cuda_model_range_fits(model_size, kv_offset, nk * row_bytes) ||
+        !cuda_tensor_has_f32(in, (uint64_t)width * rows) ||
+        !cuda_tensor_has_f32(q, (uint64_t)nq * rows) ||
+        !cuda_tensor_has_f32(kv, (uint64_t)nk * rows)) return 0;
+    if (v41_q8_pair_overlap(q->ptr, (uint64_t)nq * rows * 4u, kv->ptr, (uint64_t)nk * rows * 4u) ||
+        v41_q8_pair_overlap(q->ptr, (uint64_t)nq * rows * 4u, in->ptr, (uint64_t)width * rows * 4u) ||
+        v41_q8_pair_overlap(kv->ptr, (uint64_t)nk * rows * 4u, in->ptr, (uint64_t)width * rows * 4u)) return 0;
+    const unsigned char *qw = (const unsigned char *)cuda_model_range_ptr(
+        model_map, q_offset, nq * row_bytes, "V4.1 query-A pair");
+    const unsigned char *kw = (const unsigned char *)cuda_model_range_ptr(
+        model_map, kv_offset, nk * row_bytes, "V4.1 KV pair");
+    if (!qw || !kw) return 0;
+    if (rows == 1u) {
+        v41_pair_q8_scalar<true><<<(nq + nk) / 8u, 256u>>>(
+            (float *)q->ptr, (float *)kv->ptr, qw, kw, (const float *)in->ptr,
+            width, nq, nk, row_bytes);
+    } else {
+#define V41_Q8_PAIR_ROW(N) case N: \
+        v41_pair_q8_tiny<N, true><<<nq + nk, 32u>>>( \
+            (float *)q->ptr, (float *)kv->ptr, qw, kw, (const float *)in->ptr, \
+            width, nq, nk, row_bytes); break
+        switch (rows) {
+            V41_Q8_PAIR_ROW(2); V41_Q8_PAIR_ROW(3); V41_Q8_PAIR_ROW(4);
+            V41_Q8_PAIR_ROW(5); V41_Q8_PAIR_ROW(6);
+            default: return 0;
+        }
+#undef V41_Q8_PAIR_ROW
+    }
+    const char *trace = getenv("DS4_ROCM_V41_Q8_PAIR_TRACE");
+    if (trace && !strcmp(trace, "1")) fprintf(stderr, "V41_Q8_PAIR rows=%u\n", rows);
+    return cuda_ok(cudaGetLastError(), "V4.1 paired query-A/KV BF16");
+}
+
+template <bool ROUND_BF16>
+static int v41_q8_projection_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                                 uint64_t weight_offset, uint32_t width, uint32_t outputs,
                                                 uint32_t rows, const ds4_gpu_tensor *in) {
     uint64_t weight_bytes = 0;
@@ -1353,24 +1573,45 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
     const unsigned char *weights = (const unsigned char *)cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "V4.1 Q8 projection");
     if (!weights) return 0;
+    bool fused = false;
+    if constexpr (ROUND_BF16) {
+        const char *flag = getenv("DS4_ROCM_V41_Q8_SMALL_BF16_FUSION");
+        if (rows <= 6u && ds4_rocm_is_gfx1151() && (!flag || !strcmp(flag, "1"))) {
+            const char *trace = getenv("DS4_ROCM_V41_Q8_SMALL_BF16_TRACE");
+            if (trace && !strcmp(trace, "1")) fprintf(stderr,
+                "V41_Q8_SMALL_BF16 rows=%u width=%u outputs=%u\n", rows, width, outputs);
+            if (rows == 1u) {
+                v41_q8_f32_blocks4_kernel<true><<<(outputs + 7u) / 8u, 256u>>>(
+                    (float *)out->ptr, weights, (const float *)in->ptr,
+                    width, outputs, (uint64_t)(width / 32u) * 34u);
+                return cuda_ok(cudaGetLastError(), "V4.1 scalar Q8 fused BF16");
+            }
+            return v41_q8_f32_tiny_rows_launch<1u, true>((float *)out->ptr, weights,
+                (const float *)in->ptr, width, outputs, rows,
+                (uint64_t)(width / 32u) * 34u);
+        }
+    }
     if (rows == 1u && ds4_rocm_is_gfx1151()) {
         v41_q8_f32_blocks4_kernel<<<(outputs + 7u) / 8u, 256u>>>(
             (float *)out->ptr, weights, (const float *)in->ptr,
             width, outputs, (uint64_t)(width / 32u) * 34u);
     } else if (rows <= 6u && ds4_rocm_is_gfx1151()) {
-        return v41_q8_f32_tiny_rows_launch<1u>((float *)out->ptr, weights,
+        const int ok = v41_q8_f32_tiny_rows_launch<1u>((float *)out->ptr, weights,
             (const float *)in->ptr, width, outputs, rows,
             (uint64_t)(width / 32u) * 34u);
+        return ok && (!ROUND_BF16 || ds4_gpu_dsv41_quantize(out, outputs, rows, DS4_V41_BF16));
     } else if (!g_quality_mode && width == 1280u && (outputs == 32768u || outputs == 16384u) && rows >= 32u && rows <= 2048u && ds4_rocm_is_gfx1151()) {
+        fused = ROUND_BF16;
         /* Query-B, including contiguous two-rank weight slices.
          * This numerical path rounds activations and decoded Q8 weights to
          * F16 before F32 accumulation; quality mode retains the F32 path. */
-        matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 16u><<<dim3(outputs / 256u, (rows + 63u) / 64u), 512u>>>(
+        matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 16u, ROUND_BF16><<<dim3(outputs / 256u, (rows + 63u) / 64u), 512u>>>(
             (float *)out->ptr, weights, (const float *)in->ptr,
             rows, width, outputs, UINT64_C(40) * 34u);
     } else if (!g_quality_mode && rows >= 32u && rows <= 2048u && rows != 128u && ds4_rocm_is_gfx1151() &&
                ((width == 5120u && (outputs == 512u || outputs == 1280u || outputs == 2304u)) ||
                 (width == 2304u && outputs == 5120u))) {
+        fused = ROUND_BF16;
         /* Query-A, KV and shared-expert projections on prefill/replay tiles.
          * The shared-F32 path remains faster for the bounded 128-row tile.
          * A two-host, full-oracle sweep selected the 256-row/pad-8 tile for
@@ -1378,17 +1619,17 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
          * 128 rows/pad-8, while Query-A crosses back to the 128-row tile at
          * the final 1984-row grid step. */
         if (width == 5120u && rows <= 32u) {
-            matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u, 8u>
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u, 8u, ROUND_BF16>
                 <<<dim3((outputs + 127u) / 128u, (rows + 63u) / 64u), 256u>>>(
                     (float *)out->ptr, weights, (const float *)in->ptr,
                     rows, width, outputs, (uint64_t)(width / 32u) * 34u);
         } else if (width == 5120u && outputs == 512u && rows >= 1984u) {
-            matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u>
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u, 0u, ROUND_BF16>
                 <<<dim3((outputs + 127u) / 128u, (rows + 63u) / 64u), 256u>>>(
                     (float *)out->ptr, weights, (const float *)in->ptr,
                     rows, width, outputs, (uint64_t)(width / 32u) * 34u);
         } else {
-            matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 8u>
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u, 8u, ROUND_BF16>
                 <<<dim3((outputs + 255u) / 256u, (rows + 63u) / 64u), 512u>>>(
                     (float *)out->ptr, weights, (const float *)in->ptr,
                     rows, width, outputs, (uint64_t)(width / 32u) * 34u);
@@ -1407,8 +1648,23 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
         matmul_q8_0_f32_batch_warp8_kernel<<<dim3((unsigned)(((uint64_t)outputs + 7u) / 8u), rows), 256>>>(
             (float *)out->ptr, weights, (const float *)in->ptr, width, outputs, rows, width / 32u);
     }
-    return cuda_ok(cudaGetLastError(), "V4.1 F32-input Q8 projection");
+    return cuda_ok(cudaGetLastError(), "V4.1 F32-input Q8 projection") &&
+        (!ROUND_BF16 || fused || ds4_gpu_dsv41_quantize(out, outputs, rows, DS4_V41_BF16));
 }
+extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t width, uint32_t outputs,
+        uint32_t rows, const ds4_gpu_tensor *in) {
+    return v41_q8_projection_rows<false>(out, model_map, model_size,
+        weight_offset, width, outputs, rows, in);
+}
+
+extern "C" int ds4_gpu_dsv41_q8_projection_rows_bf16(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t width, uint32_t outputs,
+        uint32_t rows, const ds4_gpu_tensor *in) {
+    return v41_q8_projection_rows<true>(out, model_map, model_size,
+        weight_offset, width, outputs, rows, in);
+}
+
 
 /* V4.1 grouped output-A: retain physical token strides while using the
  * existing F16-operand/F32-accumulator WMMA body on bulk prefill rows. */
@@ -1662,6 +1918,83 @@ extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(ds4_gpu_tensor *out, ds4_
     return cuda_ok(cudaGetLastError(), "V4.1 TP attention output projection");
 }
 
+__device__ static uint32_t shared_owner_rank(const int32_t *selected, uint32_t tie) {
+    uint32_t left=0;
+    for(uint32_t i=0;i<6;i++){
+        const int32_t id=selected[i];
+        if(id<0||id>=384)return 2;
+        left += id<192;
+    }
+    return left==3 ? tie : left<3 ? 0u : 1u;
+}
+
+template<bool ROUND_BF16 = false>
+__global__ static void owner_q8_scalar(float *out,
+        const unsigned char *weights, const float *input,
+        uint32_t width, uint32_t outputs, uint64_t row_bytes, const int32_t *selected, uint32_t rank, uint32_t tie) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t token = blockIdx.y;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    if (row >= outputs) return;
+    input += (uint64_t)token * width;
+    out += (uint64_t)token * outputs;
+    if (shared_owner_rank(selected, tie) != rank) {
+        if (lane == 0u) out[row] = 0.0f;
+        return;
+    }
+    const uint32_t blocks = width / 32u;
+    float acc = 0.0f;
+    for (uint32_t b = lane / 8u; b < blocks; b += 4u) {
+        const unsigned char *p = weights + row * row_bytes + (uint64_t)b * 34u;
+        const float d = q8_0_scale_scalar(p);
+        const uint32_t j = (lane & 7u) * 4u;
+        float value = 0.0f;
+#pragma unroll
+        for (uint32_t k = 0; k < 4u; k++)
+            value += (float)((const int8_t *)(p + 2u))[j + k] * input[b * 32u + j + k];
+        acc += d * value;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = ROUND_BF16 ? v41_bf16(acc) : acc;
+}
+
+
+extern "C" int ds4_gpu_dsv41_shared_owner_scalar(ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const void *map, uint64_t size, uint64_t gate_offset,
+        uint64_t up_offset, uint64_t down_offset, uint32_t rank, uint32_t tie) {
+    if (!ds4_rocm_is_gfx1151()) return 0;
+    constexpr uint64_t gate_bytes = UINT64_C(2304) * 5440u;
+    constexpr uint64_t down_bytes = UINT64_C(5120) * 2448u;
+    if (!g_deepseek41_model || !map || rank > 1u || tie > 1u ||
+        !cuda_model_range_fits(size, gate_offset, gate_bytes) ||
+        !cuda_model_range_fits(size, up_offset, gate_bytes) ||
+        !cuda_model_range_fits(size, down_offset, down_bytes) ||
+        !cuda_tensor_has_elems2(out, 1u, 5120u, 4u) ||
+        !cuda_tensor_has_elems2(gate, 1u, 2304u, 4u) ||
+        !cuda_tensor_has_elems2(up, 1u, 2304u, 4u) ||
+        !cuda_tensor_has_elems2(mid, 1u, 2304u, 4u) ||
+        !cuda_tensor_has_elems2(x, 1u, 5120u, 4u) ||
+        !cuda_tensor_has_elems2(selected, 1u, 6u, 4u)) return -1;
+    const auto *wg = (const unsigned char *)cuda_model_range_ptr(map, gate_offset, gate_bytes, "V4.1 balanced shared gate");
+    const auto *wu = (const unsigned char *)cuda_model_range_ptr(map, up_offset, gate_bytes, "V4.1 balanced shared up");
+    const auto *wd = (const unsigned char *)cuda_model_range_ptr(map, down_offset, down_bytes, "V4.1 balanced shared down");
+    if (!wg || !wu || !wd) return -1;
+    const auto *ids = (const int32_t *)selected->ptr;
+    owner_q8_scalar<true><<<288u,256u>>>((float *)gate->ptr,wg,(const float *)x->ptr,5120u,2304u,5440u,ids,rank,tie);
+    owner_q8_scalar<true><<<288u,256u>>>((float *)up->ptr,wu,(const float *)x->ptr,5120u,2304u,5440u,ids,rank,tie);
+    if (!cuda_ok(cudaGetLastError(), "V4.1 balanced shared gate/up") ||
+        !ds4_gpu_swiglu_tensor(mid,gate,up,2304u,10.0f,1.0f) ||
+        !ds4_gpu_dsv41_quantize(mid,2304u,1u,DS4_V41_BF16)) return -1;
+    owner_q8_scalar<true><<<640u,256u>>>((float *)out->ptr,wd,(const float *)mid->ptr,2304u,5120u,2448u,ids,rank,tie);
+    if (!cuda_ok(cudaGetLastError(), "V4.1 balanced shared down")) return -1;
+    const char *trace = getenv("DS4_ROCM_V41_SHARED_OWNER_TRACE");
+    if (trace && strcmp(trace, "1") == 0)
+        fprintf(stderr,"ds4: ROCm scalar shared owner rank=%u tie=%u\n",rank,tie);
+    return 1;
+}
+
 /* Staged correctness reference. Validate global IDs before any pointer-table
  * lookup; a null table entry suppresses every unowned gate/up/down load.
  * The ordinary routed-MoE dispatch is untouched. */
@@ -1671,7 +2004,8 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
         const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
-        const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t tp_rank) {
+        const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t tp_rank,
+        bool allow_pointer_cache) {
     constexpr uint32_t experts = 384u, owned = 192u, used = 6u;
     constexpr uint64_t gate_row = 1320u, down_row = 756u;
     constexpr uint64_t gate_expert = gate_row * 2304u, down_expert = down_row * 5120u;
@@ -1707,17 +2041,29 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
     const char *d = cuda_model_range_ptr(model_map, down_offset + first * down_expert,
                                         owned * down_expert, "V4.1 TP owned down");
     if (!g || !u || !d) return 0;
-    const char *tables[3][experts] = {};
-    for (uint32_t i = 0; i < owned; ++i) {
-        tables[0][first+i] = g + i * gate_expert;
-        tables[1][first+i] = u + i * gate_expert;
-        tables[2][first+i] = d + i * down_expert;
+    bool cache_failed = false;
+    const char *const *slots = allow_pointer_cache ?
+        v41_tp_pointer_cache_get(model_map, model_size, gate_offset, up_offset,
+            down_offset, tp_rank, g, u, d, &cache_failed) : nullptr;
+    if (cache_failed) return 0;
+    ds4_gpu_tensor *table = nullptr;
+    if (!slots) {
+        const char *tables[3][experts] = {};
+        for (uint32_t i = 0; i < owned; ++i) {
+            tables[0][first+i] = g + i * gate_expert;
+            tables[1][first+i] = u + i * gate_expert;
+            tables[2][first+i] = d + i * down_expert;
+        }
+        table = ds4_gpu_tensor_alloc(sizeof(tables));
+        if (!table) return 0;
+        if (!ds4_gpu_tensor_write(table, 0, tables, sizeof(tables))) {
+            ds4_gpu_tensor_free(table);
+            return 0;
+        }
+        slots = (const char *const *)table->ptr;
     }
-    ds4_gpu_tensor *table = ds4_gpu_tensor_alloc(sizeof(tables));
-    if (!table) return 0;
     const uint64_t mids = pairs * 2304u;
-    int ok = ds4_gpu_tensor_write(table, 0, tables, sizeof(tables)) &&
-        ds4_gpu_tensor_fill_f32(gate, 0.f, mids) &&
+    int ok = ds4_gpu_tensor_fill_f32(gate, 0.f, mids) &&
         ds4_gpu_tensor_fill_f32(up, 0.f, mids) &&
         ds4_gpu_tensor_fill_f32(mid, 0.f, mids);
     cuda_block_q8_K *xq = (cuda_block_q8_K *)scratch->ptr;
@@ -1726,7 +2072,6 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
             xq, (const float *)x->ptr, 5120u, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "V4.1 TP input quantization");
     }
-    const char *const *slots = (const char *const *)table->ptr;
     if (ok) {
         if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
             moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3(576u, used), 128>>>(
@@ -1762,8 +2107,7 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
             ok = cuda_ok(cudaGetLastError(), "V4.1 TP owned down");
         }
     }
-    /* The reference deliberately drains before releasing its pointer table.
-     * Persistent tables and a queued service follow ownership qualification. */
+    /* Retain the reference drain in both modes; cache only immutable tables. */
     if (!ds4_gpu_synchronize()) ok = 0;
     ds4_gpu_tensor_free(table);
     return ok;
@@ -2002,6 +2346,94 @@ __global__ static void v41_markov_part_kernel(
     }
 }
 
+/* Provisional lossless F32 sidecar path; the published F16 kernels stay intact. */
+extern "C" int ds4_gpu_dsv41_markov_f32_head_available(void) {
+    return ds4_rocm_is_gfx1151();
+}
+
+__global__ static void v41_markov_transpose_f32_kernel(
+        float *out, const float *in, uint32_t rows, uint32_t cols) {
+    __shared__ float tile[32][33];
+    const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+    const uint32_t in_col = blockIdx.x * 32u + tx;
+#pragma unroll
+    for (uint32_t j = 0; j < 32u; j += 8u) {
+        const uint32_t in_row = blockIdx.y * 32u + ty + j;
+        if (in_col < cols && in_row < rows)
+            tile[ty + j][tx] = in[(uint64_t)in_row * cols + in_col];
+    }
+    __syncthreads();
+    const uint32_t out_col = blockIdx.y * 32u + tx;
+#pragma unroll
+    for (uint32_t j = 0; j < 32u; j += 8u) {
+        const uint32_t out_row = blockIdx.x * 32u + ty + j;
+        if (out_row < cols && out_col < rows)
+            out[(uint64_t)out_row * rows + out_col] = tile[tx][ty + j];
+    }
+}
+
+extern "C" int ds4_gpu_dsv41_markov_prepare_head_f32(
+        ds4_gpu_tensor *transposed, const void *model_map,
+        uint64_t model_size, uint64_t head_offset,
+        uint32_t vocab, uint32_t rank) {
+    if (vocab != 129280u || rank != 256u ||
+        !ds4_gpu_dsv41_markov_f32_head_available()) return 0;
+    const uint64_t bytes = (uint64_t)vocab * rank * sizeof(float);
+    if (!transposed || !transposed->ptr || transposed->bytes < bytes ||
+        (uintptr_t)transposed->ptr % alignof(float) ||
+        !model_map || head_offset % alignof(float) ||
+        !cuda_model_range_fits(model_size, head_offset, bytes)) return 0;
+    const float *head = (const float *)cuda_model_range_ptr(
+        model_map, head_offset, bytes, "V4.1 F32 Markov head transpose");
+    if (!head) return 0;
+    v41_markov_transpose_f32_kernel<<<
+        dim3((rank + 31u) / 32u, (vocab + 31u) / 32u), dim3(32u, 8u)>>>(
+            (float *)transposed->ptr, head, vocab, rank);
+    return cuda_ok(cudaGetLastError(), "V4.1 F32 Markov head transpose");
+}
+
+__global__ static void v41_markov_part_f32_transposed_kernel(
+        const float *logits, const float *embed, const float *head_t,
+        const int *tokens, float *part_val, int *part_idx,
+        uint32_t vocab, uint32_t rank, uint32_t step,
+        uint32_t n_parts) {
+    extern __shared__ float embedded[];
+    const int prev = tokens[step];
+    for (uint32_t r = threadIdx.x; r < rank; r += blockDim.x)
+        embedded[r] = embed[(uint64_t)prev * rank + r];
+    __syncthreads();
+    const float *lg = logits + (uint64_t)step * vocab;
+    float best = -INFINITY;
+    int best_id = -1;
+    for (uint32_t v = blockIdx.x * blockDim.x + threadIdx.x;
+         v < vocab; v += n_parts * blockDim.x) {
+        float score = lg[v];
+        for (uint32_t r = 0; r < rank; r++)
+            score = fmaf(head_t[(uint64_t)r * vocab + v],
+                         embedded[r], score);
+        if (score > best || (score == best && (best_id < 0 || (int)v < best_id))) {
+            best = score;
+            best_id = (int)v;
+        }
+    }
+    __shared__ float values[256];
+    __shared__ int ids[256];
+    values[threadIdx.x] = best;
+    ids[threadIdx.x] = best_id;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (uint32_t k = 1; k < blockDim.x; k++)
+            if (ids[k] >= 0 &&
+                (values[k] > best ||
+                 (values[k] == best && (best_id < 0 || ids[k] < best_id)))) {
+                best = values[k];
+                best_id = ids[k];
+            }
+        part_val[blockIdx.x] = best;
+        part_idx[blockIdx.x] = best_id;
+    }
+}
+
 __global__ static void v41_markov_final_kernel(
         const float *part_val, const int *part_idx, int *tokens,
         const float *x, const void *embed, const float *conf_proj,
@@ -2031,6 +2463,9 @@ __global__ static void v41_markov_final_kernel(
             }
         tokens[step + 1u] = best_id < 0 ? 0 : best_id;
     }
+    /* Other waves must not overwrite argmax values with confidence partials
+     * while thread zero is still reading the complete block. */
+    __syncthreads();
     const int prev = tokens[step];
     float sum = 0.0f;
     for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x)
@@ -2047,6 +2482,89 @@ __global__ static void v41_markov_final_kernel(
     }
 }
 
+/* Preselected actual-weight variant9: F16 transposed head, 256 threads,
+ * ordered rank FMAs and tree argmax. Confidence arithmetic is unchanged. */
+__device__ static bool v41_markov_tree_better(float b,int bi,float a,int ai) {
+ return bi>=0 && (b>a || (b==a && (ai<0 || bi<ai)));
+}
+template<int THREADS,int U,bool TREE,bool WRITE>
+__global__ __launch_bounds__(THREADS) void v41_markov_f16_tree_part(
+ const float* logits,const half* embed,const half* head_t,const int* tokens,
+ float* pv,int* pi,unsigned vocab,unsigned rank,unsigned step,unsigned parts,float* scores) {
+ extern __shared__ float embedded[];
+ for(unsigned r=threadIdx.x;r<rank;r+=THREADS)
+  embedded[r]=__half2float(embed[(uint64_t)tokens[step]*rank+r]);
+ __syncthreads();
+ float best=-INFINITY;int id=-1;
+ for(unsigned v=blockIdx.x*THREADS+threadIdx.x;v<vocab;v+=parts*THREADS) {
+  float score=logits[(uint64_t)step*vocab+v];
+  for(unsigned base=0;base<rank;base+=U) {
+   float w[U];
+#pragma unroll
+   for(unsigned j=0;j<U;j++)
+    if(base+j<rank)w[j]=__half2float(head_t[(uint64_t)(base+j)*vocab+v]);
+#pragma unroll
+   for(unsigned j=0;j<U;j++)
+    if(base+j<rank)score=fmaf(w[j],embedded[base+j],score);
+  }
+  if constexpr(WRITE)scores[(uint64_t)step*vocab+v]=score;
+  if(v41_markov_tree_better(score,(int)v,best,id)){best=score;id=(int)v;}
+ }
+ __shared__ float values[THREADS];__shared__ int ids[THREADS];
+ values[threadIdx.x]=best;ids[threadIdx.x]=id;__syncthreads();
+ if constexpr(TREE) {
+  for(unsigned d=THREADS/2;d;d>>=1) {
+   if(threadIdx.x<d && v41_markov_tree_better(values[threadIdx.x+d],ids[threadIdx.x+d],
+                             values[threadIdx.x],ids[threadIdx.x])) {
+    values[threadIdx.x]=values[threadIdx.x+d];ids[threadIdx.x]=ids[threadIdx.x+d];
+   }
+   __syncthreads();
+  }
+  if(threadIdx.x==0){pv[blockIdx.x]=values[0];pi[blockIdx.x]=ids[0];}
+ } else if(threadIdx.x==0) {
+  for(unsigned k=1;k<THREADS;k++)if(v41_markov_tree_better(values[k],ids[k],best,id)){
+   best=values[k];id=ids[k];
+  }
+  pv[blockIdx.x]=best;pi[blockIdx.x]=id;
+ }
+}
+
+template<bool TREE>
+__global__ void v41_markov_f16_tree_final(const float* pv,const int* pi,int* tokens,const float* x,
+ const half* embed,const float* proj,float* conf,unsigned rank,unsigned dim,
+ unsigned step,unsigned parts) {
+ __shared__ float values[256];__shared__ int ids[256];
+ float best=-INFINITY;int id=-1;
+ for(unsigned p=threadIdx.x;p<parts;p+=256)
+  if(v41_markov_tree_better(pv[p],pi[p],best,id)){best=pv[p];id=pi[p];}
+ values[threadIdx.x]=best;ids[threadIdx.x]=id;__syncthreads();
+ if constexpr(TREE) {
+  for(unsigned d=128;d;d>>=1) {
+   if(threadIdx.x<d && v41_markov_tree_better(values[threadIdx.x+d],ids[threadIdx.x+d],
+                             values[threadIdx.x],ids[threadIdx.x])){
+    values[threadIdx.x]=values[threadIdx.x+d];ids[threadIdx.x]=ids[threadIdx.x+d];
+   }
+   __syncthreads();
+  }
+  if(threadIdx.x==0)tokens[step+1]=ids[0]<0?0:ids[0];
+ } else if(threadIdx.x==0) {
+  for(unsigned k=1;k<256;k++)if(v41_markov_tree_better(values[k],ids[k],best,id)){
+   best=values[k];id=ids[k];
+  }
+  tokens[step+1]=id<0?0:id;
+ }
+ // All argmax readers finish before this shared array is reused for confidence.
+ __syncthreads();
+ float sum=0;
+ for(unsigned d=threadIdx.x;d<dim;d+=256)sum=fmaf(proj[d],x[(uint64_t)step*dim+d],sum);
+ for(unsigned r=threadIdx.x;r<rank;r+=256)
+  sum=fmaf(proj[dim+r],__half2float(embed[(uint64_t)tokens[step]*rank+r]),sum);
+ values[threadIdx.x]=sum;__syncthreads();
+ if(threadIdx.x==0){
+  float total=0;for(unsigned k=0;k<256;k++)total+=values[k];conf[step]=total;
+ }
+}
+
 extern "C" int ds4_gpu_dsv41_markov_chain(
         uint32_t block, uint32_t vocab, uint32_t rank, uint32_t dim,
         const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x,
@@ -2055,13 +2573,18 @@ extern "C" int ds4_gpu_dsv41_markov_chain(
         const ds4_gpu_tensor *transposed_head,
         const ds4_gpu_tensor *conf_proj, ds4_gpu_tensor *tokens,
         ds4_gpu_tensor *conf, ds4_gpu_tensor *parts, uint32_t n_parts) {
+    const bool f32_transposed = transposed_head && !f16;
+    if (f32_transposed && (vocab != 129280u || rank != 256u ||
+        dim != 5120u || n_parts != 1024u ||
+        !ds4_gpu_dsv41_markov_f32_head_available())) return 0;
     const uint64_t weight_bytes = (uint64_t)vocab * rank * (f16 ? 2u : 4u);
     if (!block || !vocab || !rank || !dim || !n_parts || n_parts > 4096u ||
         !model_map || !logits || !x || !conf_proj || !tokens || !conf || !parts ||
         !logits->ptr || !x->ptr || !conf_proj->ptr || !tokens->ptr ||
         !conf->ptr || !parts->ptr ||
-        (transposed_head && (!transposed_head->ptr || !f16 ||
-            transposed_head->bytes < (uint64_t)vocab * rank * sizeof(half))) ||
+        (transposed_head && (!transposed_head->ptr ||
+            transposed_head->bytes < weight_bytes ||
+            (f32_transposed && (uintptr_t)transposed_head->ptr % alignof(float)))) ||
         !cuda_model_range_fits(model_size, embed_offset, weight_bytes) ||
         !cuda_model_range_fits(model_size, head_offset, weight_bytes) ||
         (uint64_t)block * vocab > logits->bytes / sizeof(float) ||
@@ -2077,20 +2600,81 @@ extern "C" int ds4_gpu_dsv41_markov_chain(
     if (!embed || !head) return 0;
     float *part_val = (float *)parts->ptr;
     int *part_idx = (int *)(part_val + n_parts);
-    const half *head_t = transposed_head ? (const half *)transposed_head->ptr : NULL;
+    const half *head_t = transposed_head && f16 ?
+        (const half *)transposed_head->ptr : NULL;
     const uint32_t launch_parts = head_t && n_parts > (vocab + 255u) / 256u ?
         (vocab + 255u) / 256u : n_parts;
+    const char *tree_env = getenv("DS4_ROCM_V41_MARKOV_TREE");
+    const bool f16_tree = (!tree_env || strcmp(tree_env, "1") == 0) &&
+        ds4_rocm_is_gfx1151() && f16 && head_t &&
+        vocab == 129280u && rank == 256u && dim == 5120u;
     for (uint32_t step = 0; step < block; step++) {
-        v41_markov_part_kernel<<<launch_parts, 256, rank * sizeof(float)>>>(
-            (const float *)logits->ptr, embed, head, head_t,
-            (const int *)tokens->ptr, part_val, part_idx, vocab, rank, step,
-            launch_parts, f16);
+        if (f16_tree) {
+            v41_markov_f16_tree_part<256, 1, true, false>
+                <<<launch_parts, 256, rank * sizeof(float)>>>(
+                    (const float *)logits->ptr, (const half *)embed, head_t,
+                    (const int *)tokens->ptr, part_val, part_idx,
+                    vocab, rank, step, launch_parts, nullptr);
+            v41_markov_f16_tree_final<true><<<1, 256>>>(
+                part_val, part_idx, (int *)tokens->ptr, (const float *)x->ptr,
+                (const half *)embed, (const float *)conf_proj->ptr,
+                (float *)conf->ptr, rank, dim, step, launch_parts);
+            continue;
+        }
+        if (f32_transposed) {
+            v41_markov_part_f32_transposed_kernel<<<n_parts, 256, rank * sizeof(float)>>>(
+                (const float *)logits->ptr, (const float *)embed,
+                (const float *)transposed_head->ptr, (const int *)tokens->ptr,
+                part_val, part_idx, vocab, rank, step, n_parts);
+        } else {
+            v41_markov_part_kernel<<<launch_parts, 256, rank * sizeof(float)>>>(
+                (const float *)logits->ptr, embed, head, head_t,
+                (const int *)tokens->ptr, part_val, part_idx, vocab, rank, step,
+                launch_parts, f16);
+        }
         v41_markov_final_kernel<<<1, 256>>>(part_val, part_idx,
             (int *)tokens->ptr, (const float *)x->ptr, embed,
             (const float *)conf_proj->ptr, (float *)conf->ptr,
             rank, dim, step, launch_parts, f16);
     }
     return cuda_ok(cudaGetLastError(), "V4.1 Markov chain");
+}
+
+__global__ static void rms_norm_weight_bf16_kernel(float *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
+    uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float *orow = out + (uint64_t)row * n;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        orow[i] = v41_bf16(xr[i] * scale * w[i]);
+    }
+}
+
+extern "C" int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
+    uint64_t weight_bytes = 0;
+    if (!model_map || !cuda_u64_mul_checked(n, sizeof(float), &weight_bytes) ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !cuda_tensor_has_elems2(out, n, rows, sizeof(float)) ||
+        !cuda_tensor_has_elems2(x, n, rows, sizeof(float))) return 0;
+    if (n == 0u || rows == 0u) return 1;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "rms_weight");
+    if (!wptr) return 0;
+    const float *w = (const float *)wptr;
+    rms_norm_weight_bf16_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
+    return cuda_ok(cudaGetLastError(), "V4.1 norm BF16 launch");
 }
 
 #endif

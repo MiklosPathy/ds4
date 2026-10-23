@@ -23,12 +23,20 @@ typedef enum {
 } ds4_v41_activation_format;
 int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
                           ds4_v41_activation_format format);
-#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(__HIP_PLATFORM_AMD__) && !defined(DS4_NO_GPU)
-/* Same reductions as the ordinary kernels, with the required BF16 store
- * folded into the operation. hc_sum reads either 4- or 24-float row weights. */
+#ifdef DS4_ROCM_BUILD
+int ds4_gpu_dsv41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *weights, uint32_t width, uint32_t rows, uint32_t stride);
+int ds4_gpu_dsv41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split, uint32_t width, uint32_t rows);
+#endif
+/* Weighted normalization with the required BF16 result. */
 int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *map, uint64_t size, uint64_t offset,
         uint32_t width, uint32_t rows, float eps);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(__HIP_PLATFORM_AMD__) && !defined(DS4_NO_GPU)
+/* Same reductions as the ordinary kernels, with the required BF16 store
+ * folded into the operation. hc_sum reads either 4- or 24-float row weights. */
+
 int ds4_gpu_dsv41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *weights, uint32_t width, uint32_t rows,
         uint32_t weight_stride);
@@ -58,6 +66,17 @@ int ds4_gpu_dsv41_shared_mask(ds4_gpu_tensor *shared, const ds4_gpu_tensor *sele
         uint32_t width, uint32_t rows, uint32_t experts, uint32_t active,
         uint32_t rank, uint32_t tie_owner);
 #endif
+#if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
+/* Scalar two-rank shared expert on the current stream. Native Q8/BF16
+ * projection arithmetic; route-based ownership changes rank reduction order.
+ * 1 queued, 0 unsupported device, -1 invalid input or launch failure. */
+int ds4_gpu_dsv41_shared_owner_scalar(ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const void *map, uint64_t size, uint64_t gate_offset,
+        uint64_t up_offset, uint64_t down_offset, uint32_t rank, uint32_t tie);
+#endif
+
 /* Full-head prefill, with BF16 rounding between the two Q8 projections. */
 int ds4_gpu_dsv41_attention_output_batch(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low,
@@ -109,6 +128,15 @@ int ds4_gpu_dsv41_markov_prepare_head(ds4_gpu_tensor *transposed,
                                      uint64_t model_size,
                                      uint64_t head_offset,
                                      uint32_t vocab, uint32_t rank);
+#ifdef DS4_ROCM_BUILD
+/* Capability check is for initialized draft setup, never a memory estimator. */
+int ds4_gpu_dsv41_markov_f32_head_available(void);
+int ds4_gpu_dsv41_markov_prepare_head_f32(ds4_gpu_tensor *transposed,
+                                         const void *model_map,
+                                         uint64_t model_size,
+                                         uint64_t head_offset,
+                                         uint32_t vocab, uint32_t rank);
+#endif
 int ds4_gpu_dsv41_markov_chain(uint32_t block, uint32_t vocab, uint32_t rank,
                               uint32_t dim, const ds4_gpu_tensor *logits,
                               const ds4_gpu_tensor *x, const void *model_map,
@@ -177,14 +205,16 @@ int ds4_gpu_dsv41_f32_projection_rows(ds4_gpu_tensor *out,
                                      uint32_t outputs, uint32_t rows,
                                      const ds4_gpu_tensor *in);
 /* V4.1 IQ2_XXS/Q2_K resident rank reference: global routing IDs, one
- * contiguous half of384 experts, and F32 partial output. */
+ * contiguous half of384 experts, and F32 partial output. The caller permits
+ * pointer caching only for target sessions; DSpark always passes false. */
 int ds4_gpu_dsv41_routed_moe_tp_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
         ds4_gpu_tensor *mid, ds4_gpu_tensor *scratch,
         const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
-        const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t tp_rank);
+        const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t tp_rank,
+        bool allow_pointer_cache);
 /* Bulk owned gate/up operator. Global routing is preserved; unowned output
  * rows are zero. The caller retains the weighted activation/down boundary. */
 int ds4_gpu_dsv41_moe_tp_gate_up(
@@ -213,7 +243,21 @@ int ds4_gpu_dsv41_hc_project(ds4_gpu_dsv41_hc_plan **plan,
 void ds4_gpu_dsv41_hc_plan_free(ds4_gpu_dsv41_hc_plan *plan);
 
 /* Preserve V4.1 activation formats while applying Q8 weights. */
+#ifdef DS4_ROCM_BUILD
+/* Fixed5120→1280/512 Q8 projections; native scalar/tiny-row arithmetic and BF16 stores. */
+int ds4_gpu_dsv41_q8_attention_pair_bf16(
+        ds4_gpu_tensor *q, ds4_gpu_tensor *kv, const void *model_map,
+        uint64_t model_size, uint64_t q_offset, uint64_t kv_offset,
+        uint32_t rows, const ds4_gpu_tensor *in);
+#endif
+
 int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out,
+                                    const void *model_map, uint64_t model_size,
+                                    uint64_t weight_offset, uint32_t width,
+                                    uint32_t outputs, uint32_t rows,
+                                    const ds4_gpu_tensor *in);
+/* Same projection and dispatch, followed by BF16; fuses only admitted WMMA stores. */
+int ds4_gpu_dsv41_q8_projection_rows_bf16(ds4_gpu_tensor *out,
                                     const void *model_map, uint64_t model_size,
                                     uint64_t weight_offset, uint32_t width,
                                     uint32_t outputs, uint32_t rows,

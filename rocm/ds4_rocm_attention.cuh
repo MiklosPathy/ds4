@@ -1258,7 +1258,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     }
 }
 
-template <int MODE, uint32_t HEADS, bool F32_VEC2 = false>
+template <int MODE, uint32_t HEADS, bool F32_VEC2 = false, uint32_t SPLITS = 0>
 __global__ static void attention_mixed_heads16_wmma_kernel(
         float *heads,
         const float *sinks,
@@ -1276,7 +1276,7 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim, float *stats = nullptr) {
     constexpr uint32_t KEYS = 80u;
     constexpr uint32_t DIMS = 64u;
     constexpr uint32_t TILE = 16u;
@@ -1402,8 +1402,8 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
     for (uint32_t i = 0; i < 32u; i++) accum[i] = 0.0f;
     if (tid < HEADS) {
         const uint32_t head = head_base + tid;
-        row_max[tid] = head < n_head ? sinks[head] : -INFINITY;
-        row_sum[tid] = head < n_head ? 1.0f : 0.0f;
+        row_max[tid] = head < n_head && (SPLITS == 0 || blockIdx.z == 0) ? sinks[head] : -INFINITY;
+        row_sum[tid] = head < n_head && (SPLITS == 0 || blockIdx.z == 0) ? 1.0f : 0.0f;
     }
     __syncthreads();
 
@@ -1412,7 +1412,13 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
     using frag_b_row = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, half, rocwmma::row_major>;
     using frag_c = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float>;
 
-    for (uint32_t kb = 0; kb < n_score; kb += KEYS) {
+    uint32_t begin = 0, end = n_score;
+    if constexpr (SPLITS > 0) {
+        const uint32_t blocks = (n_score + KEYS - 1u) / KEYS;
+        begin = blocks * blockIdx.z / SPLITS * KEYS;
+        end = blocks * (blockIdx.z + 1u) / SPLITS * KEYS;
+    }
+    for (uint32_t kb = begin; kb < end; kb += KEYS) {
         frag_a qa;
         frag_b_col kk;
         frag_c score_acc;
@@ -1643,8 +1649,17 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
         const uint32_t head = head_base + head_local;
         const uint32_t dim = out_idx - head_local * 512u;
         if (head < n_head) {
-            const float inv = row_sum[head_local] == 0.0f ? 0.0f : 1.0f / row_sum[head_local];
-            heads[((uint64_t)t * n_head + head) * 512u + dim] = accum[i] * inv;
+            if constexpr (SPLITS == 0) {
+                const float inv = row_sum[head_local] == 0.0f ? 0.0f : 1.0f / row_sum[head_local];
+                heads[((uint64_t)t * n_head + head) * 512u + dim] = accum[i] * inv;
+            } else {
+                const uint64_t ph = ((uint64_t)t * SPLITS + blockIdx.z) * n_head + head;
+                heads[ph * 512u + dim] = accum[i];
+                if (dim == 0u) {
+                    stats[ph * 2u] = row_max[head_local];
+                    stats[ph * 2u + 1u] = row_sum[head_local];
+                }
+            }
         }
     }
 }
@@ -2031,5 +2046,34 @@ __global__ static void ds41_attention_split_combine_kernel(
             value += parts[((uint64_t)k * n_head + head) * 512u + dim] *
                      expf(lse[k * n_head + head] - max_lse);
         out[(uint64_t)head * 512u + dim] = value / denominator;
+    }
+}
+
+
+
+template<uint32_t SPLITS>
+__global__ static void ds41_attention_verifier_split_combine(float* out,const float* parts,const float* stats,uint32_t heads) {
+    const uint32_t h=blockIdx.x,t=blockIdx.y;
+    __shared__ float alpha[SPLITS];
+    __shared__ float inv;
+    if(threadIdx.x==0){
+        float mx=-INFINITY;
+        for(uint32_t k=0;k<SPLITS;k++){
+            const uint64_t ph=((uint64_t)t*SPLITS+k)*heads+h;
+            if(stats[ph*2+1]>0)mx=fmaxf(mx,stats[ph*2]);
+        }
+        float den=0;
+        for(uint32_t k=0;k<SPLITS;k++){
+            const uint64_t ph=((uint64_t)t*SPLITS+k)*heads+h;
+            alpha[k]=stats[ph*2+1]>0?expf(stats[ph*2]-mx):0;
+            den+=stats[ph*2+1]*alpha[k];
+        }
+        inv=den>0?1.f/den:0;
+    }
+    __syncthreads();
+    for(uint32_t d=threadIdx.x;d<512;d+=blockDim.x){
+        float v=0;
+        for(uint32_t k=0;k<SPLITS;k++)v+=parts[(((uint64_t)t*SPLITS+k)*heads+h)*512+d]*alpha[k];
+        out[((uint64_t)t*heads+h)*512+d]=v*inv;
     }
 }

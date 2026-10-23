@@ -4245,7 +4245,15 @@ int ds4_mmq_moe_down_sum6_vec_impl(
     /* Short Flash blocks need more CTAs to fill Spark, especially at one
      * token. The dot products and ordered six-expert sum stay unchanged. */
     bool small_tiles = false;
-#ifndef GGML_USE_HIP
+#ifdef GGML_USE_HIP
+    static const bool q2_small_tiles = []() {
+        const char *value = getenv("DS4_ROCM_V41_Q2_SMALL_TILES");
+        return !value || strcmp(value, "1") == 0;
+    }();
+    small_tiles = q2_small_tiles && type == GGML_TYPE_Q2_K &&
+        ggml_cuda_info().devices[dev].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
+        M == 5120 && K == 2304 && n_tokens >= 2 && n_tokens <= 6 && n_experts == 384;
+#else
     small_tiles = type == GGML_TYPE_MXFP4 &&
         ggml_cuda_info().devices[dev].cc == GGML_CUDA_CC_DGX_SPARK &&
         M == 4096 && (K == 1024 || K == 2048) && n_tokens <= 8;
@@ -4265,7 +4273,12 @@ int ds4_mmq_moe_down_sum6_vec_impl(
         W, (const block_q8_1 *)src1_q8_1_ptr, ids, out_f32, \
         (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts, \
         stride_row_x, stride_col_y, stride_channel_x)
-#ifndef GGML_USE_HIP
+#ifdef GGML_USE_HIP
+    if constexpr (type == GGML_TYPE_Q2_K) {
+        if (small_tiles) { DS4_LAUNCH_DOWN_ROWS(1); }
+        else { DS4_LAUNCH_DOWN_ROWS(8); }
+    } else
+#else
     if constexpr (type == GGML_TYPE_MXFP4) {
         if (small_tiles) { DS4_LAUNCH_DOWN_ROWS(1); }
         else { DS4_LAUNCH_DOWN_ROWS(8); }

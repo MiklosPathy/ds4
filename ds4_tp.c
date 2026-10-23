@@ -99,10 +99,16 @@
 #define DS4_TP_MBOX_SPIN_MS 50u
 
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
+#ifdef DS4_TP_LINUX
+/* Allow uneven ROCm GPU readiness without failing a healthy peer exchange.
+ * Completed exchanges return immediately; this is only a failure deadline. */
+#define DS4_TP_DEFAULT_GATE_TIMEOUT_MS 2000
+#else
 /* Once both ranks enter a Metal gate, a live exchange normally completes in
  * microseconds. Fail well before Metal's command-buffer watchdog if the peer
  * stalls while keeping its sockets open. */
 #define DS4_TP_DEFAULT_GATE_TIMEOUT_MS 750
+#endif
 
 typedef struct {
     uint32_t magic;
@@ -2660,7 +2666,7 @@ int ds4_tp_agree_execution_mode(ds4_tp *tp, uint32_t flags, char *err, size_t er
     }
     const uint32_t known = DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT |
         DS4_TP_MODE_V41_SHARED_OWNER | DS4_TP_MODE_V41_SHARED_BALANCE |
-        DS4_TP_MODE_V41_DSPARK;
+        DS4_TP_MODE_V41_DSPARK | DS4_TP_MODE_V41_ROCM_SHARED_OWNER;
     if (peer[0] != mine[0] || peer[1] != flags || (flags & ~known) != 0) {
         ds4_tp_mark_failed(tp);
         tp_set_err(err, errlen, "tp execution mode mismatch (peer 0x%x, local 0x%x); "
