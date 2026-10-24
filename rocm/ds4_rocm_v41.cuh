@@ -2126,8 +2126,167 @@ extern "C" int ds4_gpu_dsv41_routed_moe_tp_tensor(
     return ok;
 }
 
-/* Native MXFP4 uses the same quantized activation/reduction primitives as
- * resident dispatch. Null global-ID entries prevent every unowned load. */
+/* Native MXFP4 x Q8_K matrix kernel. Four routed tokens use
+ * the current sorted metadata; 16 feature rows share each WMMA fragment.
+ * FP32 scale/accumulation order differs from the scalar half-block reader. */
+__global__ static void moe_down_mxfp4_tp_wmma_tile4_kernel(
+        float *partials, const char *down_table, const cuda_block_q8_K *midq,
+        const uint32_t *sorted, const uint32_t *offsets, const uint32_t *counts,
+        const uint32_t *total_tiles, const uint32_t *tile_experts,
+        const uint32_t *tile_starts, uint64_t down_row_bytes) {
+    using i4 = int __attribute__((ext_vector_type(4)));
+    using i8 = int __attribute__((ext_vector_type(8)));
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *total_tiles) return;
+    const uint32_t expert = tile_experts[tile];
+    const char *base = ((const char *const *)down_table)[expert];
+    if (!base) return;
+    const uint32_t start = tile_starts[tile];
+    const uint32_t np = min(counts[expert] - start, 4u);
+    uint32_t pair[4] = {};
+    #pragma unroll
+    for (uint32_t p = 0; p < 4u; ++p)
+        if (p < np) pair[p] = sorted[offsets[expert] + start + p];
+    __shared__ cuda_block_q8_K staged[4u * 9u];
+    constexpr uint32_t words = 9u * sizeof(cuda_block_q8_K) / sizeof(uint32_t);
+    for (uint32_t i = threadIdx.x; i < np * words; i += blockDim.x) {
+        const uint32_t p = i / words, word = i - p * words;
+        ((uint32_t *)staged)[i] = ((const uint32_t *)(midq + (uint64_t)pair[p] * 9u))[word];
+    }
+    __syncthreads();
+    const uint32_t lane = threadIdx.x & 31u, row = lane & 15u, half = lane >> 4u;
+    const uint32_t first_feature = blockIdx.x * 64u + (threadIdx.x >> 5u) * 16u;
+    const auto *w = (const cuda_block_mxfp4 *)(base + (uint64_t)(first_feature + row) * down_row_bytes);
+    float acc[8] = {};
+    for (uint32_t mb = 0; mb < 72u; ++mb) {
+        i4 a = {}, b = {};
+        const cuda_block_q8_K *x = row < np ? staged + row * 9u + (mb >> 3u) : nullptr;
+        #pragma unroll
+        for (uint32_t j = 0; j < 4u; ++j) {
+            const uint32_t packed = *(const uint32_t *)(w[mb].qs + 4u * j);
+            a[j] = (int)dev_mxfp4_unpack4(packed >> (half * 4u));
+            b[j] = x ? *(const int32_t *)(x->qs + (mb & 7u) * 32u + half * 16u + 4u * j) : 0;
+        }
+        i4 ao, bo;
+        #pragma unroll
+        for (uint32_t j = 0; j < 4u; ++j) {
+            ao[j] = __shfl_xor(a[j], 16, 32);
+            bo[j] = __shfl_xor(b[j], 16, 32);
+        }
+        i4 a0 = half ? ao : a, a1 = half ? a : ao;
+        i4 b0 = half ? bo : b, b1 = half ? b : bo;
+        i8 z = {};
+        z = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, z, true);
+        z = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, z, true);
+        const float weight_scale = dev_e8m0_to_f32(w[mb].e);
+        const float activation_scale = x ? 0.5f * x->d : 0.f;
+        #pragma unroll
+        for (uint32_t j = 0; j < 8u; ++j) {
+            const float scale = activation_scale * __shfl(weight_scale, 2u * j + half, 32);
+            acc[j] += scale * (float)z[j];
+        }
+    }
+    if (row < np) {
+        #pragma unroll
+        for (uint32_t j = 0; j < 8u; ++j)
+            partials[(uint64_t)pair[row] * 5120u + first_feature + 2u * j + half] = acc[j];
+    }
+}
+
+/* Bulk gate/up: existing sorted routing and Q8_K inputs.
+ * Both native projections share activation fragments. Sequential K32 FP32
+ * accumulation differs from the original half-block/warp reduction. */
+__global__ static void moe_gate_up_mid_mxfp4_tp_wmma_tile16_kernel(
+        float *gate_out, float *up_out, float *mid_out,
+        const char *gate_table, const char *up_table,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted, const uint32_t *offsets, const uint32_t *counts,
+        const uint32_t *total_tiles, const uint32_t *tile_experts,
+        const uint32_t *tile_starts, const float *weights) {
+    using i4 = int __attribute__((ext_vector_type(4)));
+    using i8 = int __attribute__((ext_vector_type(8)));
+    const uint32_t tile = blockIdx.y;
+    if (tile >= *total_tiles) return;
+    const uint32_t expert = tile_experts[tile];
+    const char *gate_base = ((const char *const *)gate_table)[expert];
+    const char *up_base = ((const char *const *)up_table)[expert];
+    if (!gate_base || !up_base) return;
+    const uint32_t start = tile_starts[tile];
+    /* Existing metadata has four-pair starts. A start divisible by sixteen
+     * owns the next sixteen pairs; intervening starts belong to that group.
+     * Sparse experts use the scalar tile. Checks precede all barriers. */
+    if ((start & 15u) || counts[expert] < 8u) return;
+    const uint32_t np = min(counts[expert] - start, 16u);
+    const uint32_t lane = threadIdx.x & 31u, row = lane & 15u, half = lane >> 4u;
+    const uint32_t pair = row < np ? sorted[offsets[expert] + start + row] : 0u;
+    __shared__ cuda_block_q8_K staged[16u];
+    constexpr uint32_t words = sizeof(cuda_block_q8_K) / sizeof(uint32_t);
+    const uint32_t first_feature = blockIdx.x * 64u + (threadIdx.x >> 5u) * 16u;
+    const auto *gw = (const cuda_block_mxfp4 *)(gate_base + (uint64_t)(first_feature + row) * 2720u);
+    const auto *uw = (const cuda_block_mxfp4 *)(up_base + (uint64_t)(first_feature + row) * 2720u);
+    float gate[8] = {}, up[8] = {};
+    for (uint32_t qb = 0; qb < 20u; ++qb) {
+        for (uint32_t i = threadIdx.x; i < np * words; i += blockDim.x) {
+            const uint32_t p = i / words, word = i - p * words;
+            const uint32_t input_pair = sorted[offsets[expert] + start + p];
+            const auto *src = (const uint32_t *)(xq + (uint64_t)(input_pair / 6u) * 20u + qb);
+            ((uint32_t *)staged)[i] = src[word];
+        }
+        __syncthreads();
+        for (uint32_t subblock = 0; subblock < 8u; ++subblock) {
+            const uint32_t mb = qb * 8u + subblock;
+            const cuda_block_q8_K *x = row < np ? staged + row : nullptr;
+            i4 b = {};
+            #pragma unroll
+            for (uint32_t j = 0; j < 4u; ++j)
+                b[j] = x ? *(const int32_t *)(x->qs + (mb & 7u) * 32u + half * 16u + 4u * j) : 0;
+            i4 bo;
+            #pragma unroll
+            for (uint32_t j = 0; j < 4u; ++j) bo[j] = __shfl_xor(b[j], 16, 32);
+            const i4 b0 = half ? bo : b, b1 = half ? b : bo;
+            const float activation_scale = x ? 0.5f * x->d : 0.f;
+            #pragma unroll
+            for (uint32_t projection = 0; projection < 2u; ++projection) {
+                const auto *w = projection ? uw : gw;
+                i4 a = {};
+                #pragma unroll
+                for (uint32_t j = 0; j < 4u; ++j) {
+                    const uint32_t packed = *(const uint32_t *)(w[mb].qs + 4u * j);
+                    a[j] = (int)dev_mxfp4_unpack4(packed >> (half * 4u));
+                }
+                i4 ao;
+                #pragma unroll
+                for (uint32_t j = 0; j < 4u; ++j) ao[j] = __shfl_xor(a[j], 16, 32);
+                const i4 a0 = half ? ao : a, a1 = half ? a : ao;
+                i8 z = {};
+                z = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, z, true);
+                z = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, z, true);
+                const float weight_scale = dev_e8m0_to_f32(w[mb].e);
+                #pragma unroll
+                for (uint32_t j = 0; j < 8u; ++j) {
+                    const float scale = activation_scale * __shfl(weight_scale, 2u * j + half, 32);
+                    if (projection) up[j] += scale * (float)z[j];
+                    else gate[j] += scale * (float)z[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (row < np) {
+        #pragma unroll
+        for (uint32_t j = 0; j < 8u; ++j) {
+            float g = gate[j], u = up[j];
+            if (g > 10.f) g = 10.f;
+            if (u > 10.f) u = 10.f;
+            if (u < -10.f) u = -10.f;
+            const uint64_t off = (uint64_t)pair * 2304u + first_feature + 2u * j + half;
+            gate_out[off] = g;
+            up_out[off] = u;
+            mid_out[off] = (g / (1.f + expf(-g))) * u * weights[pair];
+        }
+    }
+}
+
 extern "C" int ds4_gpu_dsv41_routed_moe_typed_tp_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
         ds4_gpu_tensor *mid, ds4_gpu_tensor *scratch,
@@ -2182,13 +2341,18 @@ extern "C" int ds4_gpu_dsv41_routed_moe_typed_tp_tensor(
         ok = cuda_ok(cudaGetLastError(), "V4.1 MXFP4 TP input quantization");
     }
     const char *bulk_env = getenv("DS4_ROCM_V41_MXFP4_TP_BULK");
-    const bool bulk = n_tokens >= 128u && ds4_rocm_is_gfx1151() &&
-        (!bulk_env || !strcmp(bulk_env, "1"));
+    const char *verify_env = getenv("DS4_ROCM_V41_MXFP4_TP_VERIFY_TILE");
+    const bool verify_tile = n_tokens == 6u && ds4_rocm_is_gfx1151() &&
+        (!verify_env || !strcmp(verify_env, "1") || !strcmp(verify_env, "2"));
+    const uint32_t tile_tokens = verify_tile &&
+        (!verify_env || !strcmp(verify_env, "2")) ? 2u : 4u;
+    const bool bulk = verify_tile || (n_tokens >= 128u && ds4_rocm_is_gfx1151() &&
+        (!bulk_env || !strcmp(bulk_env, "1")));
     ds4_gpu_tensor *metadata = nullptr;
     if (ok && bulk) {
         /* Stable global-ID buckets preserve the caller's routing arrays.
          * Remote expert tiles exit through null immutable table entries. */
-        const uint32_t capacity = routed_moe_expert_tile_capacity((uint32_t)pairs, 4u, experts);
+        const uint32_t capacity = routed_moe_expert_tile_capacity((uint32_t)pairs, tile_tokens, experts);
         const uint64_t words = 4u * (experts + 1u) + pairs + 1u + 2u * capacity;
         metadata = ds4_gpu_tensor_alloc(words * sizeof(uint32_t));
         if (!metadata) ok = 0;
@@ -2201,20 +2365,50 @@ extern "C" int ds4_gpu_dsv41_routed_moe_typed_tp_tensor(
             uint32_t *total = sorted + pairs;
             uint32_t *tile_experts = total + 1u;
             uint32_t *starts = tile_experts + capacity;
-            ok = cuda_ok(cudaMemset(counts, 0, (experts + 1u) * sizeof(uint32_t)), "MXFP4 TP bucket clear");
+            if (!verify_tile)
+                ok = cuda_ok(cudaMemset(counts, 0, (experts + 1u) * sizeof(uint32_t)), "MXFP4 TP bucket clear");
             for (ds4_gpu_tensor *target : {gate, up, mid})
                 if (ok) ok = cuda_ok(cudaMemset(target->ptr, 0, pairs * 2304u * sizeof(float)), "MXFP4 TP owned output clear");
             if (ok) {
-                moe_count_sorted_pairs_kernel<<<(pairs + 255u) / 256u, 256u>>>(counts, (const int32_t *)selected->ptr, (uint32_t)pairs, experts);
-                moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, experts);
-                moe_scatter_sorted_pairs_deterministic_kernel<<<experts, 1>>>(sorted, offsets, (const int32_t *)selected->ptr, (uint32_t)pairs, experts);
-                moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile_offsets, total, counts, 4u, experts);
-                moe_build_expert_tiles_kernel<<<2, 256>>>(tile_experts, starts, tile_offsets, counts, 4u, experts);
-                moe_gate_up_mid_mxfp4_tp_tile4_qwarp32_kernel<4u><<<dim3(capacity, 288u), 256u, 4u * 20u * sizeof(cuda_block_q8_K)>>>(
-                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
-                    slots, slots + experts * sizeof(char *), q, sorted, offsets, counts,
-                    total, tile_experts, starts, (const float *)weights->ptr,
-                    gate_expert, gate_row, 20u, 2304u, used, 0u, 1u, 10.f);
+                if (verify_tile) {
+                    /* Three to six rows have at most 36 validated pairs, within the existing
+                     * narrow builder's 48-entry shared routing array. */
+                    moe_build_narrow_sorted_tiles_kernel<<<1u, 256u>>>(
+                        counts, offsets, sorted, tile_offsets, total,
+                        tile_experts, starts, (const int32_t *)selected->ptr,
+                        (uint32_t)pairs, tile_tokens, experts);
+                } else {
+                    moe_count_sorted_pairs_kernel<<<(pairs + 255u) / 256u, 256u>>>(counts, (const int32_t *)selected->ptr, (uint32_t)pairs, experts);
+                    moe_prefix_sorted_pairs_kernel<<<1, 1>>>(offsets, cursors, counts, experts);
+                    moe_scatter_sorted_pairs_deterministic_kernel<<<experts, 1>>>(sorted, offsets, (const int32_t *)selected->ptr, (uint32_t)pairs, experts);
+                    moe_build_expert_tile_offsets_kernel<<<1, 1>>>(tile_offsets, total, counts, 4u, experts);
+                    moe_build_expert_tiles_kernel<<<2, 256>>>(tile_experts, starts, tile_offsets, counts, 4u, experts);
+                }
+                const char *gate_wmma = getenv("DS4_ROCM_V41_MXFP4_TP_GATE_WMMA");
+                if (tile_tokens == 2u) {
+                    moe_gate_up_mid_mxfp4_tp_tile4_qwarp32_kernel<2u><<<dim3(capacity, 288u), 256u, 2u * 20u * sizeof(cuda_block_q8_K)>>>(
+                        (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                        slots, slots + experts * sizeof(char *), q, sorted, offsets, counts,
+                        total, tile_experts, starts, (const float *)weights->ptr,
+                        gate_expert, gate_row, 20u, 2304u, used, 0u, 1u, 10.f);
+                } else if (n_tokens >= 128u && (!gate_wmma || !strcmp(gate_wmma, "1"))) {
+                    /* Sparse experts keep the existing exact four-row path. */
+                    moe_gate_up_mid_mxfp4_tp_tile4_qwarp32_kernel<4u><<<dim3(capacity, 288u), 256u, 4u * 20u * sizeof(cuda_block_q8_K)>>>(
+                        (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                        slots, slots + experts * sizeof(char *), q, sorted, offsets, counts,
+                        total, tile_experts, starts, (const float *)weights->ptr,
+                        gate_expert, gate_row, 20u, 2304u, used, 8u, 1u, 10.f);
+                    moe_gate_up_mid_mxfp4_tp_wmma_tile16_kernel<<<dim3(36u, capacity), 128u>>>(
+                        (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                        slots, slots + experts * sizeof(char *), q, sorted, offsets, counts,
+                        total, tile_experts, starts, (const float *)weights->ptr);
+                } else {
+                    moe_gate_up_mid_mxfp4_tp_tile4_qwarp32_kernel<4u><<<dim3(capacity, 288u), 256u, 4u * 20u * sizeof(cuda_block_q8_K)>>>(
+                        (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                        slots, slots + experts * sizeof(char *), q, sorted, offsets, counts,
+                        total, tile_experts, starts, (const float *)weights->ptr,
+                        gate_expert, gate_row, 20u, 2304u, used, 0u, 1u, 10.f);
+                }
                 ok = cuda_ok(cudaGetLastError(), "V4.1 MXFP4 TP owned tile4 qwarp32 gate/up");
             }
         }
@@ -2232,10 +2426,42 @@ extern "C" int ds4_gpu_dsv41_routed_moe_typed_tp_tensor(
         ok = cuda_ok(cudaGetLastError(), "V4.1 MXFP4 TP mid quantization");
     }
     if (ok) {
-        moe_down_mxfp4_sum6_qwarp32_kernel<true, true><<<dim3(640u, n_tokens), 256u>>>(
-            (float *)out->ptr, slots + 2u * experts * sizeof(char *), q,
-            (const int32_t *)selected->ptr, down_expert, down_row, 9u, 5120u, used);
-        ok = cuda_ok(cudaGetLastError(), "V4.1 MXFP4 TP owned down");
+        const char *sorted_env = getenv("DS4_ROCM_V41_MXFP4_TP_DOWN_SORTED");
+        const bool sorted_down = metadata && bulk && n_tokens >= 128u &&
+            ds4_rocm_is_gfx1151() && (!sorted_env || strcmp(sorted_env, "0"));
+        if (sorted_down) {
+            /* The input scratch contains live quantized activations. Partial
+             * outputs need distinct storage until the slot sum completes. */
+            ds4_gpu_tensor *partials = ds4_gpu_tensor_alloc(pairs * 5120u * sizeof(float));
+            if (!partials) ok = 0;
+            if (ok) ok = cuda_ok(cudaMemset(partials->ptr, 0, pairs * 5120u * sizeof(float)),
+                                 "MXFP4 TP sorted down owned output clear");
+            if (ok) {
+                const uint32_t capacity = routed_moe_expert_tile_capacity((uint32_t)pairs, 4u, experts);
+                const uint32_t *counts = (const uint32_t *)metadata->ptr;
+                const uint32_t *offsets = counts + experts + 1u;
+                const uint32_t *sorted = counts + 4u * (experts + 1u);
+                const uint32_t *total = sorted + pairs;
+                const uint32_t *tile_experts = total + 1u;
+                const uint32_t *starts = tile_experts + capacity;
+                moe_down_mxfp4_tp_wmma_tile4_kernel<<<dim3(80u, capacity), 128u>>>(
+                    (float *)partials->ptr, slots + 2u * experts * sizeof(char *), q,
+                    sorted, offsets, counts, total, tile_experts, starts, down_row);
+                ok = cuda_ok(cudaGetLastError(), "MXFP4 TP sorted down partials");
+                if (ok) {
+                    moe_sum_kernel<<<(n_tokens * 5120u + 255u) / 256u, 256u>>>(
+                        (float *)out->ptr, (const float *)partials->ptr, 5120u, used, n_tokens);
+                    ok = cuda_ok(cudaGetLastError(), "MXFP4 TP sorted down slot sum");
+                }
+            }
+            if (!ds4_gpu_synchronize()) ok = 0;
+            ds4_gpu_tensor_free(partials);
+        } else {
+            moe_down_mxfp4_sum6_qwarp32_kernel<true, true><<<dim3(640u, n_tokens), 256u>>>(
+                (float *)out->ptr, slots + 2u * experts * sizeof(char *), q,
+                (const int32_t *)selected->ptr, down_expert, down_row, 9u, 5120u, used);
+        }
+        if (ok) ok = cuda_ok(cudaGetLastError(), "V4.1 MXFP4 TP owned down");
     }
     if (!ds4_gpu_synchronize()) ok = 0;
     ds4_gpu_tensor_free(metadata);
