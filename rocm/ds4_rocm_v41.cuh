@@ -1938,27 +1938,37 @@ extern "C" int ds4_gpu_dsv41_attention_output_tp_batch(ds4_gpu_tensor *out, ds4_
         out_a_offset, out_b_offset, heads, n_tokens, tp_rank * 4u, 4u);
 }
 
-__device__ static uint32_t shared_owner_rank(const int32_t *selected, uint32_t tie) {
-    uint32_t left=0;
+/* The rank whose contiguous expert slice holds the fewest selected routed
+ * experts owns the shared expert. Ties go to the first tied rank counting
+ * from tie. An invalid route returns world, so no rank owns it. */
+__device__ static uint32_t shared_owner_rank(const int32_t *selected, uint32_t tie, uint32_t world) {
+    uint32_t count[3] = {0u, 0u, 0u};
+    const uint32_t per = 384u / world;
     for(uint32_t i=0;i<6;i++){
         const int32_t id=selected[i];
-        if(id<0||id>=384)return 2;
-        left += id<192;
+        if(id<0||id>=384)return world;
+        count[(uint32_t)id / per]++;
     }
-    return left==3 ? tie : left<3 ? 0u : 1u;
+    uint32_t owner = tie;
+    for (uint32_t k = 1; k < world; k++) {
+        const uint32_t r = (tie + k) % world;
+        if (count[r] < count[owner]) owner = r;
+    }
+    return owner;
 }
 
 template<bool ROUND_BF16 = false>
 __global__ static void owner_q8_scalar(float *out,
         const unsigned char *weights, const float *input,
-        uint32_t width, uint32_t outputs, uint64_t row_bytes, const int32_t *selected, uint32_t rank, uint32_t tie) {
+        uint32_t width, uint32_t outputs, uint64_t row_bytes, const int32_t *selected, uint32_t rank, uint32_t tie,
+        uint32_t world) {
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t token = blockIdx.y;
     const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
     if (row >= outputs) return;
     input += (uint64_t)token * width;
     out += (uint64_t)token * outputs;
-    if (shared_owner_rank(selected, tie) != rank) {
+    if (shared_owner_rank(selected, tie, world) != rank) {
         if (lane == 0u) out[row] = 0.0f;
         return;
     }
@@ -1983,11 +1993,13 @@ extern "C" int ds4_gpu_dsv41_shared_owner_scalar(ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
         const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
         const void *map, uint64_t size, uint64_t gate_offset,
-        uint64_t up_offset, uint64_t down_offset, uint32_t rank, uint32_t tie) {
+        uint64_t up_offset, uint64_t down_offset, uint32_t rank, uint32_t tie,
+        uint32_t world) {
     if (!ds4_rocm_is_gfx1151()) return 0;
     constexpr uint64_t gate_bytes = UINT64_C(2304) * 5440u;
     constexpr uint64_t down_bytes = UINT64_C(5120) * 2448u;
-    if (!g_deepseek41_model || !map || rank > 1u || tie > 1u ||
+    if (!g_deepseek41_model || !map || (world != 2u && world != 3u) ||
+        rank >= world || tie >= world ||
         !cuda_model_range_fits(size, gate_offset, gate_bytes) ||
         !cuda_model_range_fits(size, up_offset, gate_bytes) ||
         !cuda_model_range_fits(size, down_offset, down_bytes) ||
@@ -2002,16 +2014,16 @@ extern "C" int ds4_gpu_dsv41_shared_owner_scalar(ds4_gpu_tensor *out,
     const auto *wd = (const unsigned char *)cuda_model_range_ptr(map, down_offset, down_bytes, "V4.1 balanced shared down");
     if (!wg || !wu || !wd) return -1;
     const auto *ids = (const int32_t *)selected->ptr;
-    owner_q8_scalar<true><<<288u,256u>>>((float *)gate->ptr,wg,(const float *)x->ptr,5120u,2304u,5440u,ids,rank,tie);
-    owner_q8_scalar<true><<<288u,256u>>>((float *)up->ptr,wu,(const float *)x->ptr,5120u,2304u,5440u,ids,rank,tie);
+    owner_q8_scalar<true><<<288u,256u>>>((float *)gate->ptr,wg,(const float *)x->ptr,5120u,2304u,5440u,ids,rank,tie,world);
+    owner_q8_scalar<true><<<288u,256u>>>((float *)up->ptr,wu,(const float *)x->ptr,5120u,2304u,5440u,ids,rank,tie,world);
     if (!cuda_ok(cudaGetLastError(), "V4.1 balanced shared gate/up") ||
         !ds4_gpu_swiglu_tensor(mid,gate,up,2304u,10.0f,1.0f) ||
         !ds4_gpu_dsv41_quantize(mid,2304u,1u,DS4_V41_BF16)) return -1;
-    owner_q8_scalar<true><<<640u,256u>>>((float *)out->ptr,wd,(const float *)mid->ptr,2304u,5120u,2448u,ids,rank,tie);
+    owner_q8_scalar<true><<<640u,256u>>>((float *)out->ptr,wd,(const float *)mid->ptr,2304u,5120u,2448u,ids,rank,tie,world);
     if (!cuda_ok(cudaGetLastError(), "V4.1 balanced shared down")) return -1;
     const char *trace = getenv("DS4_ROCM_V41_SHARED_OWNER_TRACE");
     if (trace && strcmp(trace, "1") == 0)
-        fprintf(stderr,"ds4: ROCm scalar shared owner rank=%u tie=%u\n",rank,tie);
+        fprintf(stderr,"ds4: ROCm scalar shared owner rank=%u/%u tie=%u\n",rank,world,tie);
     return 1;
 }
 

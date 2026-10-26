@@ -67,14 +67,17 @@ int ds4_gpu_dsv41_shared_mask(ds4_gpu_tensor *shared, const ds4_gpu_tensor *sele
         uint32_t rank, uint32_t tie_owner);
 #endif
 #if defined(DS4_ROCM_BUILD) || defined(__HIP_PLATFORM_AMD__)
-/* Scalar two-rank shared expert on the current stream. Native Q8/BF16
- * projection arithmetic; route-based ownership changes rank reduction order.
+/* Scalar two- or three-rank shared expert on the current stream. Native
+ * Q8/BF16 projection arithmetic; the rank owning the fewest selected routed
+ * experts computes it (ties from rank tie), the others write zero.
+ * Route-based ownership changes rank reduction order.
  * 1 queued, 0 unsupported device, -1 invalid input or launch failure. */
 int ds4_gpu_dsv41_shared_owner_scalar(ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
         const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
         const void *map, uint64_t size, uint64_t gate_offset,
-        uint64_t up_offset, uint64_t down_offset, uint32_t rank, uint32_t tie);
+        uint64_t up_offset, uint64_t down_offset, uint32_t rank, uint32_t tie,
+        uint32_t world);
 #endif
 
 /* Full-head prefill, with BF16 rounding between the two Q8 projections. */

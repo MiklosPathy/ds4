@@ -42247,10 +42247,8 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     bool shared_here = !shared_owner || g->tp_rank == ds41_shared_owner_rank(g, il);
     bool shared_queued = false;
 #ifdef DS4_ROCM_BUILD
-    /* A DSpark session keeps its draft state during scalar catch-up too.
-     * The balanced owner kernel splits experts between exactly two ranks;
-     * the three-rank mesh keeps the per-layer owner. */
-    if (shared_owner && g->tp_world == 2u && !g->draft && !g->dspark &&
+    /* A DSpark session keeps its draft state during scalar catch-up too. */
+    if (shared_owner && !g->draft && !g->dspark &&
         ds41_rocm_shared_owner_enabled() &&
         l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
@@ -42259,7 +42257,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             g->shared_gate,g->shared_up,g->shared_mid,g->norm,g->selected,
             m->map,m->size,l->ffn_gate_shexp->abs_offset,
             l->ffn_up_shexp->abs_offset,l->ffn_down_shexp->abs_offset,
-            g->tp_rank,il & 1u);
+            g->tp_rank, ds41_shared_owner_rank(g, il), g->tp_world);
         if (rc < 0) return false;
         if (rc > 0) { shared_here = true; shared_queued = true; }
     }
@@ -76283,7 +76281,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         execution_mode |= DS4_TP_MODE_V41_SHARED_OWNER;
         if (ds41_shared_balance_enabled()) execution_mode |= DS4_TP_MODE_V41_SHARED_BALANCE;
 #ifdef DS4_ROCM_BUILD
-        if (!e->dspark && ds4_tp_world(tp) == 2 && ds41_rocm_shared_owner_enabled())
+        if (!e->dspark && ds41_rocm_shared_owner_enabled())
             execution_mode |= DS4_TP_MODE_V41_ROCM_SHARED_OWNER;
 #endif
     }

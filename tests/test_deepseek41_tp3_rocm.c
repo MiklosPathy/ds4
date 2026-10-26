@@ -4,7 +4,10 @@
  * must reproduce the eight-group low projection bit for bit and the full
  * output projection within float reassociation error.
  * Routed Q4_K MoE: the three owned-expert partials must sum to the full
- * routed output across the decode, small-batch, tiled and atomic paths. */
+ * routed output across the decode, small-batch, tiled and atomic paths.
+ * Shared-expert owner: exactly the rank with the fewest selected routed
+ * experts (ties from the layer's rank) computes the shared expert, with the
+ * same bits for two and three ranks; the two-rank choice is unchanged. */
 #define _POSIX_C_SOURCE 200809L
 #include "ds4_gpu.h"
 #include <math.h>
@@ -204,6 +207,88 @@ static int moe(unsigned n) {
     return 1;
 }
 
+/* ------------------------------------------------------------ shared owner */
+
+/* Reference owner: fewest selected routed experts, ties from tie. */
+static unsigned host_owner(const int32_t *sel, unsigned tie, unsigned world) {
+    unsigned count[3] = {0, 0, 0};
+    for (unsigned i = 0; i < 6; i++) count[(unsigned)sel[i] / (384u / world)]++;
+    unsigned owner = tie;
+    for (unsigned k = 1; k < world; k++) {
+        const unsigned r = (tie + k) % world;
+        if (count[r] < count[owner]) owner = r;
+    }
+    return owner;
+}
+
+static int shared_owner(void) {
+    enum { E = 5120, F = 2304 };
+    const size_t gb = (size_t)F * (E / 32) * 34, db = (size_t)E * (F / 32) * 34;
+    const size_t wb = 2 * gb + db;
+    unsigned char *model = NULL;
+    CHECK(!posix_memalign((void **)&model, 4096, wb));
+    for (size_t off = 0; off < wb; off += 34) {
+        uint16_t d = f16_bits(0.001f + 0.002f * (float)(rng() % 16u));
+        memcpy(model + off, &d, 2);
+        for (unsigned j = 0; j < 32; j++) model[off + 2 + j] = (unsigned char)(rng() & 0xff);
+    }
+    float *x = malloc(E * 4), *out = malloc(E * 4), *ref = malloc(E * 4);
+    CHECK(x && out && ref);
+    for (unsigned i = 0; i < E; i++) x[i] = frand();
+    ds4_gpu_set_deepseek41_model(true);
+    CHECK(ds4_gpu_set_model_map(model, wb));
+    ds4_gpu_tensor *xt = upload(x, E * 4), *ot = ds4_gpu_tensor_alloc(E * 4),
+        *gt = ds4_gpu_tensor_alloc(F * 4), *ut = ds4_gpu_tensor_alloc(F * 4),
+        *mt = ds4_gpu_tensor_alloc(F * 4), *st = ds4_gpu_tensor_alloc(6 * 4);
+    CHECK(xt && ot && gt && ut && mt && st);
+    /* Balanced, skewed, tied and single-slice routes. */
+    static const int32_t routes[][6] = {
+        {0, 1, 200, 201, 300, 301},   {5, 6, 7, 8, 130, 383},
+        {10, 140, 270, 20, 150, 280}, {0, 1, 2, 3, 4, 5},
+        {129, 130, 131, 132, 133, 134}, {191, 192, 255, 256, 383, 0},
+    };
+    unsigned cases = 0;
+    for (unsigned r = 0; r < sizeof(routes) / sizeof(*routes); r++) {
+        CHECK(ds4_gpu_tensor_write(st, 0, routes[r], sizeof(routes[r])));
+        for (unsigned il = 0; il < 6; il++) {
+            int have_ref = 0;
+            for (unsigned world = 2; world <= 3; world++) {
+                const unsigned tie = il % world, owner = host_owner(routes[r], tie, world);
+                if (world == 2) {
+                    /* The original two-rank rule: fewer experts below 192. */
+                    unsigned left = 0;
+                    for (unsigned i = 0; i < 6; i++) left += routes[r][i] < 192;
+                    CHECK(owner == (left == 3 ? tie : left < 3 ? 0u : 1u));
+                }
+                for (unsigned rank = 0; rank < world; rank++) {
+                    CHECK(ds4_gpu_dsv41_shared_owner_scalar(ot, gt, ut, mt, xt, st, model, wb,
+                        0, gb, 2 * gb, rank, tie, world) == 1);
+                    CHECK(ds4_gpu_synchronize());
+                    CHECK(ds4_gpu_tensor_read(ot, 0, out, E * 4));
+                    unsigned nonzero = 0;
+                    for (unsigned i = 0; i < E; i++) nonzero += out[i] != 0.0f;
+                    if (rank != owner) { CHECK(nonzero == 0); continue; }
+                    CHECK(nonzero > E / 2);
+                    if (!have_ref) { memcpy(ref, out, E * 4); have_ref = 1; }
+                    else CHECK(!memcmp(ref, out, E * 4));
+                    cases++;
+                }
+            }
+        }
+    }
+    /* No owner outside the two- and three-rank layouts. */
+    CHECK(ds4_gpu_dsv41_shared_owner_scalar(ot, gt, ut, mt, xt, st, model, wb,
+        0, gb, 2 * gb, 3, 0, 3) == -1);
+    CHECK(ds4_gpu_dsv41_shared_owner_scalar(ot, gt, ut, mt, xt, st, model, wb,
+        0, gb, 2 * gb, 0, 0, 4) == -1);
+    fprintf(stderr, "shared owner cases=%u\n", cases);
+    ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(ot); ds4_gpu_tensor_free(gt);
+    ds4_gpu_tensor_free(ut); ds4_gpu_tensor_free(mt); ds4_gpu_tensor_free(st);
+    ds4_gpu_cleanup();
+    free(model); free(x); free(out); free(ref);
+    return 1;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     const unsigned attn_rows[] = {1, 7, 64, 2048};
@@ -212,6 +297,7 @@ int main(void) {
     const unsigned moe_rows[] = {1, 8, 64, 256};
     for (unsigned i = 0; i < sizeof(moe_rows) / sizeof(*moe_rows); i++)
         if (!moe(moe_rows[i])) return 1;
-    puts("V4.1 three-rank attention groups and owned Q4_K MoE PASS");
+    if (!shared_owner()) return 1;
+    puts("V4.1 three-rank attention groups, owned Q4_K MoE and shared owner PASS");
     return 0;
 }
