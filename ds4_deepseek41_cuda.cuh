@@ -12,6 +12,50 @@ __device__ static float dsv41_bf16(float x) {
     return __uint_as_float(bits & 0xffff0000u);
 }
 
+extern "C" int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t offset,
+        uint32_t width, uint32_t rows, float eps) {
+    const uint64_t count = (uint64_t)width * rows;
+    if (!map || !width || !rows || !dsv41_has_floats(out, count) ||
+        !dsv41_has_floats(x, count) || offset > size ||
+        (uint64_t)width * 4u > size - offset) return 0;
+    const float *w = (const float *)cuda_resolve_weight_ptr(map, offset,
+        (uint64_t)width * 4u, ds4_tensor_device_idx(out), "V4.1 norm");
+    if (!w) return 0;
+    rms_norm_weight_kernel<true><<<rows, 256, 0, cuda_decode_stream()>>>(
+        (float *)out->ptr, (const float *)x->ptr, w, width, rows, eps);
+    return cuda_ok(cudaGetLastError(), "V4.1 BF16 norm");
+}
+
+extern "C" int ds4_gpu_dsv41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *weights, uint32_t width, uint32_t rows,
+        uint32_t weight_stride) {
+    const uint64_t count = (uint64_t)width * rows;
+    if (!width || !rows || (weight_stride != 4 && weight_stride != 24) ||
+        (count + 255u) / 256u > INT32_MAX || !dsv41_has_floats(out, count) ||
+        !dsv41_has_floats(x, count * 4u) ||
+        !dsv41_has_floats(weights, (uint64_t)(rows - 1u) * weight_stride + 4u)) return 0;
+    hc_weighted_sum_kernel<true><<<(count + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
+        (float *)out->ptr, (const float *)x->ptr, (const float *)weights->ptr,
+        width, 4u, rows, weight_stride);
+    return cuda_ok(cudaGetLastError(), "V4.1 BF16 HC sum");
+}
+
+extern "C" int ds4_gpu_dsv41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
+        uint32_t width, uint32_t rows) {
+    const uint64_t count = (uint64_t)width * rows;
+    if (!width || !rows || count > (uint64_t)INT32_MAX * 64u ||
+        !dsv41_has_floats(out, count * 4u) || !dsv41_has_floats(residual, count * 4u) ||
+        !dsv41_has_floats(block, count) || !dsv41_has_floats(split, (uint64_t)rows * 24u)) return 0;
+    const float *sp = (const float *)split->ptr;
+    hc_expand_kernel<true><<<(count * 4u + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
+        (float *)out->ptr, (const float *)block->ptr, NULL, NULL,
+        (const float *)residual->ptr, sp + 4u, sp + 8u,
+        width, 4u, rows, 24u, 24u, 0, 0);
+    return cuda_ok(cudaGetLastError(), "V4.1 BF16 HC expansion");
+}
+
 __device__ static float dsv41_pow2_ceil(float x) {
     const uint32_t bits = __float_as_uint(x);
     return __uint_as_float((bits & 0x7f800000u) +
@@ -71,26 +115,163 @@ extern "C" int ds4_gpu_dsv41_shared_join(void) {
     return ok;
 }
 
+__global__ static void dsv41_shared_gate_up_kernel(
+        float *gate, float *up, float *mid,
+        const unsigned char *wg, const unsigned char *wu,
+        const int8_t *xq, const float *xs,
+        uint32_t blocks, uint32_t hidden, float clamp, int dp4a, const int *enabled) {
+    const uint32_t row = blockIdx.x * 8u + threadIdx.x / 32u;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= hidden) return;
+    if (enabled && !*enabled) {
+        if (lane == 0) mid[row] = 0.0f;
+        return;
+    }
+    float g = 0, u = 0;
+    for (uint32_t b = lane; b < blocks; b += 32u) {
+        const uint64_t off = ((uint64_t)row * blocks + b) * 34u;
+        const int8_t *xb = xq + b * 32u;
+        const int dg = dot_i8_block((const int8_t *)(wg + off + 2u), xb, 32, dp4a);
+        const int du = dot_i8_block((const int8_t *)(wu + off + 2u), xb, 32, dp4a);
+        g += __half2float(*(const __half *)(wg + off)) * xs[b] * (float)dg;
+        u += __half2float(*(const __half *)(wu + off)) * xs[b] * (float)du;
+    }
+    g = dsv41_bf16(warp_sum_f32(g));
+    u = dsv41_bf16(warp_sum_f32(u));
+    if (lane == 0) {
+        gate[row] = g;
+        up[row] = u;
+        if (clamp > 1.0e-6f) {
+            g = fminf(g, clamp);
+            u = fminf(fmaxf(u, -clamp), clamp);
+        }
+        mid[row] = dsv41_bf16((g / (1.0f + expf(-g))) * u);
+    }
+}
+
+__global__ static void dsv41_shared_down_kernel(float *out, const unsigned char *w,
+        const int8_t *xq, const float *xs, uint32_t blocks, uint32_t width, int dp4a,
+        const int *enabled) {
+    const uint32_t row = blockIdx.x * 8u + threadIdx.x / 32u;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= width) return;
+    if (enabled && !*enabled) {
+        if (lane == 0) out[row] = 0.0f;
+        return;
+    }
+    float sum = 0;
+    for (uint32_t b = lane; b < blocks; b += 32u) {
+        const uint64_t off = ((uint64_t)row * blocks + b) * 34u;
+        const int dot = dot_i8_block((const int8_t *)(w + off + 2u), xq + b * 32u, 32, dp4a);
+        sum += __half2float(*(const __half *)(w + off)) * xs[b] * (float)dot;
+    }
+    sum = warp_sum_f32(sum);
+    if (lane == 0) out[row] = dsv41_bf16(sum);
+}
+
+static bool dsv41_shared_fused(ds4_gpu_tensor *out, ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up, ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t gate_off, uint64_t up_off,
+        uint64_t down_off, uint32_t width, uint32_t hidden, float clamp,
+        const int *enabled) {
+    const uint64_t gu_bytes = (uint64_t)hidden * (width / 32u) * 34u;
+    const uint64_t down_bytes = (uint64_t)width * (hidden / 32u) * 34u;
+    if (!map || gate_off > size || gu_bytes > size - gate_off ||
+        up_off > size || gu_bytes > size - up_off ||
+        down_off > size || down_bytes > size - down_off) return false;
+    const auto *wg = (const unsigned char *)cuda_resolve_weight_ptr(map, gate_off, gu_bytes, 0, "shared gate");
+    const auto *wu = (const unsigned char *)cuda_resolve_weight_ptr(map, up_off, gu_bytes, 0, "shared up");
+    const auto *wd = (const unsigned char *)cuda_resolve_weight_ptr(map, down_off, down_bytes, 0, "shared down");
+    if (!wg || !wu || !wd) return false;
+    auto *xq = (int8_t *)g_dsv41_shared.scratch;
+    auto *xs = (float *)((char *)g_dsv41_shared.scratch + std::max(width, hidden));
+    const cudaStream_t stream = cuda_decode_stream();
+    const int dp4a = cuda_q8_use_dp4a();
+    quantize_q8_0_f32_kernel<<<width / 32u, 32, 0, stream>>>(
+        xq, xs, (const float *)x->ptr, width, width / 32u);
+    dsv41_shared_gate_up_kernel<<<(hidden + 7u) / 8u, 256, 0, stream>>>(
+        (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+        wg, wu, xq, xs, width / 32u, hidden, clamp, dp4a, enabled);
+    quantize_q8_0_f32_kernel<<<hidden / 32u, 32, 0, stream>>>(
+        xq, xs, (const float *)mid->ptr, hidden, hidden / 32u);
+    dsv41_shared_down_kernel<<<(width + 7u) / 8u, 256, 0, stream>>>(
+        (float *)out->ptr, wd, xq, xs, hidden / 32u, width, dp4a, enabled);
+    return cuda_ok(cudaGetLastError(), "V4.1 fused shared expert");
+}
+
+__device__ static uint32_t dsv41_shared_owner(const int32_t *selected,
+        uint32_t experts, uint32_t active, uint32_t tie) {
+    uint32_t left = 0;
+    for (uint32_t i = 0; i < active; i++) left += (uint32_t)selected[i] < experts / 2u;
+    return left * 2u == active ? tie : left * 2u < active ? 0u : 1u;
+}
+
+__global__ static void dsv41_shared_owner_kernel(int *enabled, const int32_t *selected,
+        uint32_t experts, uint32_t active, uint32_t rank, uint32_t tie) {
+    *enabled = rank == dsv41_shared_owner(selected, experts, active, tie);
+}
+
+__global__ static void dsv41_shared_mask_kernel(float *shared, const int32_t *selected,
+        uint32_t width, uint32_t experts, uint32_t active, uint32_t rank, uint32_t tie) {
+    const uint32_t row = blockIdx.x;
+    __shared__ bool enabled;
+    if (!threadIdx.x) enabled = rank == dsv41_shared_owner(selected + row * active, experts, active, tie);
+    __syncthreads();
+    if (!enabled) for (uint32_t i = threadIdx.x; i < width; i += blockDim.x)
+        shared[(uint64_t)row * width + i] = 0.0f;
+}
+
+extern "C" int ds4_gpu_dsv41_shared_mask(ds4_gpu_tensor *shared, const ds4_gpu_tensor *selected,
+        uint32_t width, uint32_t rows, uint32_t experts, uint32_t active,
+        uint32_t rank, uint32_t tie_owner) {
+    if (!width || !rows || rows > 8u || !experts || experts % 2u ||
+        !active || active > experts || rank > 1u || tie_owner > 1u ||
+        !dsv41_has_floats(shared, (uint64_t)width * rows) ||
+        !dsv41_has_floats(selected, (uint64_t)active * rows)) return 0;
+    dsv41_shared_mask_kernel<<<rows, 256, 0, cuda_decode_stream()>>>(
+        (float *)shared->ptr, (const int32_t *)selected->ptr,
+        width, experts, active, rank, tie_owner);
+    return cuda_ok(cudaGetLastError(), "V4.1 batched shared owner");
+}
+
 extern "C" int ds4_gpu_dsv41_shared_start(
         ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
-        uint32_t width, uint32_t hidden, float clamp) {
+        uint32_t width, uint32_t hidden, float clamp,
+        const ds4_v41_shared_owner *owner) {
     if (!ds4_gpu_device_is_spark()) return 0;
     if (g_dsv41_shared.active || g_dsv41_shared.pending || !width || !hidden ||
         !dsv41_has_floats(x, width) || !dsv41_has_floats(out, width) ||
         !dsv41_has_floats(gate, hidden) || !dsv41_has_floats(up, hidden) ||
         !dsv41_has_floats(mid, hidden)) return -1;
     const uint64_t blocks = ((uint64_t)std::max(width, hidden) + 31u) / 32u;
-    if (blocks * 36u > CUDA_DSV41_SHARED_SCRATCH ||
+    if (owner && (!owner->experts || owner->experts % 2u || !owner->active ||
+        owner->active > owner->experts || owner->rank > 1u || owner->tie_owner > 1u ||
+        !dsv41_has_floats(owner->selected, owner->active))) return -1;
+    if (blocks * 36u > CUDA_DSV41_SHARED_SCRATCH - sizeof(int) ||
         !cuda_dsv41_shared_prepare()) return 0;
     const cudaStream_t main = cuda_decode_stream();
+    const bool fused = width % 32u == 0 && hidden % 32u == 0 &&
+        !getenv("DS4_CUDA_DISABLE_V41_SHARED_FUSION");
+    if (owner && !fused) return 0;
+    int *enabled = owner ? (int *)((char *)g_dsv41_shared.scratch +
+                                  CUDA_DSV41_SHARED_SCRATCH - sizeof(int)) : NULL;
+    /* Decide before the owned-expert filter mutates selected on the main
+     * stream. The ready event publishes this decision to the side stream. */
+    if (owner) {
+        dsv41_shared_owner_kernel<<<1, 1, 0, main>>>(enabled,
+            (const int32_t *)owner->selected->ptr, owner->experts, owner->active,
+            owner->rank, owner->tie_owner);
+        if (!cuda_ok(cudaGetLastError(), "V4.1 shared expert owner")) return -1;
+    }
     if (!cuda_ok(cudaEventRecord(g_dsv41_shared.ready, main), "shared expert ready") ||
         !cuda_ok(cudaStreamWaitEvent(g_dsv41_shared.stream, g_dsv41_shared.ready, 0),
                  "shared expert input wait")) return -1;
     g_dsv41_shared.active = true;
-    const bool ok =
+    const bool ok = fused ? dsv41_shared_fused(out, gate, up, mid, x, model_map,
+        model_size, gate_offset, up_offset, down_offset, width, hidden, clamp, enabled) :
         ds4_gpu_matmul_q8_0_tensor(gate, model_map, model_size,
                                    gate_offset, width, hidden, x, 1) &&
         ds4_gpu_dsv41_quantize(gate, hidden, 1, DS4_V41_BF16) &&
@@ -416,7 +597,35 @@ extern "C" int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const 
         (start + 1u) / ratio < 1024u ||
         !dsv41_has_floats(selected, (uint64_t)rows * 512u) ||
         !dsv41_has_floats(scores, (uint64_t)rows * width)) return 0;
-    for (uint32_t row = 0; row < rows; row++) {
+    uint32_t row = 0;
+    /* Batch independent causal rows, splitting only at a sort-width boundary. */
+    while (row < rows && (start + row + 1u) / ratio <= 4096u) {
+        const uint32_t visible = (start + row + 1u) / ratio;
+        const uint32_t sort = visible <= 1024u ? 1024u : visible <= 2048u ? 2048u : 4096u;
+        const uint32_t available = (sort + 1u) * ratio - 1u - (start + row);
+        const uint32_t count = rows - row < available ? rows - row : available;
+        uint32_t *dst = (uint32_t *)selected->ptr + (uint64_t)row * 512u;
+        const float *src = (const float *)scores->ptr + (uint64_t)row * width;
+        if (sort == 1024u)
+            indexer_topk_pow2_kernel<1024, true><<<count, 1024>>>(
+                dst, src, width, count, 512u, start + row, ratio);
+        else if (sort == 2048u)
+            indexer_topk_pow2_kernel<2048, true><<<count, 1024>>>(
+                dst, src, width, count, 512u, start + row, ratio);
+        else
+            indexer_topk_pow2_kernel<4096, true><<<count, 1024>>>(
+                dst, src, width, count, 512u, start + row, ratio);
+        if (!cuda_ok(cudaGetLastError(), "V4.1 causal topk batch")) return 0;
+        row += count;
+    }
+    if (rows - row >= 2u && getenv("DS4_CUDA_NO_TOPK_STREAM") == NULL) {
+        indexer_topk_stream512_kernel<true><<<rows - row, 512>>>(
+            (uint32_t *)selected->ptr + (uint64_t)row * 512u,
+            (const float *)scores->ptr + (uint64_t)row * width,
+            width, rows - row, 512u, start + row, ratio);
+        return cuda_ok(cudaGetLastError(), "V4.1 wide causal topk batch");
+    }
+    for (; row < rows; row++) {
         const uint32_t visible = (start + row + 1u) / ratio;
         ds4_gpu_tensor src = *scores, dst = *selected;
         src.ptr = (float *)src.ptr + (uint64_t)row * width;

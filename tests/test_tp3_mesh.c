@@ -51,11 +51,21 @@ static int run_rank(int rank, int port) {
     char err[512] = "";
     CHECK(ds4_tp_create(&tp, &opt, &id, err, sizeof(err)) || (fprintf(stderr, "%s\n", err), 0));
     CHECK(ds4_tp_world(tp) == 3 && ds4_tp_rank(tp) == rank);
+    /* Engine bind agreements run over the mesh, not a single data socket. */
+    CHECK(ds4_tp_agree_execution_mode(tp, DS4_TP_MODE_V41_SHARED_OWNER, err, sizeof(err)) ||
+          (fprintf(stderr, "%s\n", err), 0));
 
     /* Scalar gates through the slab. */
     const uint64_t slab_bytes = ds4_tp_slab_bytes(40, 5120);
     uint8_t *slab = calloc(1, slab_bytes);
     CHECK(slab && ds4_tp_attach_slab(tp, slab, err, sizeof(err)));
+    {
+        uint8_t meta[DS4_TP_DSPARK_META_BYTES] = {0};
+        bool agreed = true, peer_on = true;
+        CHECK(ds4_tp_agree_dspark_split(tp, false, meta, &agreed, &peer_on, err, sizeof(err)) ||
+              (fprintf(stderr, "%s\n", err), 0));
+        CHECK(!agreed && !peer_on);
+    }
     for (uint32_t layer = 0; layer < 40; layer++) {
         for (uint32_t gate = 0; gate < 2; gate++) {
             float *out = (float *)(slab + ds4_tp_slab_out_offset(tp, layer, gate));
