@@ -2757,11 +2757,35 @@ fail:
     return 0;
 }
 
+#ifdef DS4_TP_LINUX
+static int tp3_exchange(ds4_tp *tp, const void *hdr, void *peer_hdr_buf,
+                        size_t hdr_bytes, const void *out, uint64_t bytes,
+                        uint64_t timeout_ms);
+#endif
+
+/* Symmetric setup agreement.  The three-rank mesh has no single data socket;
+ * every rank exchanges with both peers, and the peers must agree with each
+ * other before one copy is returned for the local comparison. */
+static int tp_agree_exchange(ds4_tp *tp, const void *mine, void *peer, size_t bytes) {
+#ifdef DS4_TP_LINUX
+    if (tp->world == 3) {
+        uint8_t both[2u * 512u];
+        if (bytes > 512u ||
+            !tp3_exchange(tp, mine, both, bytes, NULL, 0, tp->gate_timeout_ms)) return 0;
+        /* Report whichever peer differs from this rank, so a mismatch on
+         * either link reaches the caller's check. */
+        memcpy(peer, memcmp(both, mine, bytes) != 0 ? both : both + bytes, bytes);
+        return 1;
+    }
+#endif
+    return tp_tcp_exchange(tp, NULL, NULL, mine, peer, bytes);
+}
+
 int ds4_tp_agree_execution_mode(ds4_tp *tp, uint32_t flags, char *err, size_t errlen) {
     if (!tp || ds4_tp_failed(tp)) return 0;
     const uint32_t mine[2] = {DS4_TP_MAGIC, flags};
     uint32_t peer[2];
-    if (!tp_tcp_exchange(tp, NULL, NULL, mine, peer, sizeof(mine))) {
+    if (!tp_agree_exchange(tp, mine, peer, sizeof(mine))) {
         ds4_tp_mark_failed(tp);
         tp_set_err(err, errlen, "tp execution mode exchange failed");
         return 0;
@@ -4340,7 +4364,7 @@ int ds4_tp_agree_dspark_split(ds4_tp *tp, bool mine_on, const void *meta,
     const uint32_t head[2] = { DS4_TP_DSPARK_MAGIC, mine_on ? 1u : 0u };
     memcpy(mine, head, sizeof(head));
     memcpy(mine + sizeof(head), meta, DS4_TP_DSPARK_META_BYTES);
-    if (!tp_tcp_exchange(tp, NULL, NULL, mine, peer, sizeof(mine))) {
+    if (!tp_agree_exchange(tp, mine, peer, sizeof(mine))) {
         ds4_tp_mark_failed(tp);
         tp_set_err(err, errlen, "tp DSpark split exchange failed");
         return 0;
